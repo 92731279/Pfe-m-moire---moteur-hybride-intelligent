@@ -1,0 +1,33 @@
+# Environnement virtuel
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Données lourdes GeoNames (trop lourdes pour GitHub)
+data/geonames/raw/
+data/geonames/db/
+*.sqlite
+*.txt.Zone.Identifier
+
+# Outputs
+data/outputs/
+data/samples/
+data/kb/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Libpostal
+libpostal/
