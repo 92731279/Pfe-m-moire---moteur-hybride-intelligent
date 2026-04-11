@@ -1,0 +1,32 @@
+Metadata-Version: 2.4
+Name: postal
+Version: 1.1.11
+Summary: Python bindings to libpostal for fast international address parsing/normalization
+Home-page: https://github.com/openvenues/pypostal
+Download-URL: https://github.com/openvenues/pypostal/tarball/1.1.11
+Maintainer: mapzen.com
+Maintainer-email: pelias@mapzen.com
+License: MIT License
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Information Technology
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: C
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.5
+Classifier: Operating System :: MacOS :: MacOS X
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Topic :: Text Processing :: Linguistic
+Classifier: Topic :: Scientific/Engineering :: GIS
+Classifier: Topic :: Internet :: WWW/HTTP :: Indexing/Search
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+License-File: LICENSE
+Requires-Dist: six
+Dynamic: classifier
+Dynamic: download-url
+Dynamic: home-page
+Dynamic: license
+Dynamic: license-file
+Dynamic: maintainer
+Dynamic: maintainer-email
+Dynamic: requires-dist
+Dynamic: summary

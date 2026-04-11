@@ -9,7 +9,13 @@ from src.toponym_normalizer import (
     canonicalize_toponym, town_known_for_country,
     find_variant_match_in_address, toponyms_equivalent,
 )
-
+# Ajouter après les imports existants
+try:
+    from src.geonames.geonames_validator import validate_town_in_country
+    GEONAMES_AVAILABLE = True
+    print("✅ GeoNames disponible")
+except Exception as e:
+    GEONAMES_AVAILABLE = False
 VALID_COUNTRIES: Set[str] = set(CITIES_BY_COUNTRY.keys())
 
 
@@ -84,43 +90,56 @@ def _validate_pass1_country_town(
         _append_warning_once(warnings, "pass1_town_missing")
         party.meta.parse_confidence = min(party.meta.parse_confidence, 0.70)
     else:
-        if country in CITIES_BY_COUNTRY:
-            if town_known_for_country(country, town):
-                # ✅ Ville connue pour ce pays → canonicaliser
-                geo.town = canonicalize_toponym(geo.town)
+        if GEONAMES_AVAILABLE:
+            # Validation mondiale via GeoNames (4 niveaux)
+            is_valid, canonical, matched_via = validate_town_in_country(
+                country, town
+            )
+            if is_valid:
+                geo.town = canonical or geo.town
                 town = _norm(geo.town)
                 geo_coherent = True
+                _append_warning_once(
+                    warnings,
+                    f"pass1_town_validated_geonames:{matched_via}"
+                )
             else:
-                # Chercher variante dans les adresses
+                # Fallback toponym_normalizer
                 variant = find_variant_match_in_address(
                     party.address_lines, geo.town
                 )
                 if variant:
-                    observed, canonical = variant
-                    geo.town = canonical
-                    town = _norm(canonical)
+                    observed, canonical_t = variant
+                    geo.town = canonical_t
+                    town = _norm(canonical_t)
                     geo_coherent = True
                     _append_warning_once(
                         warnings,
-                        f"pass1_town_variant_matched:{observed}→{canonical}",
-                    )
-                    party.meta.parse_confidence = min(
-                        1.0,
-                        round(max(party.meta.parse_confidence, 0.80), 2),
+                        f"pass1_town_variant_matched:{observed}→{canonical_t}",
                     )
                 else:
-                    # ❌ Ville inconnue pour ce pays
+                    # Ville non trouvée nulle part
                     _append_warning_once(
                         warnings,
-                        f"pass1_town_not_in_country:{country}:{town}",
+                        f"pass1_town_not_found_worldwide:{country}:{town}",
                     )
                     party.meta.parse_confidence = min(
                         party.meta.parse_confidence, 0.60
                     )
         else:
-            # Pays pas dans notre référentiel de villes
-            geo_coherent = bool(country and town)
-
+            # Fallback sans GeoNames
+            if town_known_for_country(country, town):
+                geo.town = canonicalize_toponym(geo.town)
+                town = _norm(geo.town)
+                geo_coherent = True
+            else:
+                _append_warning_once(
+                    warnings,
+                    f"pass1_town_not_in_country:{country}:{town}",
+                )
+                party.meta.parse_confidence = min(
+                    party.meta.parse_confidence, 0.60
+                )
     return country, town, geo_coherent
 
 
