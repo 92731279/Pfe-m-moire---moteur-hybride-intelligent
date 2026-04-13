@@ -5,6 +5,7 @@ import sys
 import json
 import streamlit as st
 import time
+from pathlib import Path
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -18,12 +19,52 @@ st.set_page_config(page_title="Moteur hybride SWIFT", layout="wide")
 st.title("Moteur hybride SWIFT → JSON canonique")
 st.caption("E0 Prétraitement · E1 Parsing · E2 Validation · E3 SLM")
 
-default_message = """:50K:/FR7630006000011234567890189
+SAMPLES_PATH = Path(PROJECT_ROOT) / "data" / "samples" / "mt103_party_cases.json"
+
+
+def load_sample_cases():
+    if not SAMPLES_PATH.exists():
+        return []
+    with open(SAMPLES_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+sample_cases = load_sample_cases()
+sample_labels = [case["label"] for case in sample_cases]
+
+if not sample_cases:
+    default_message = """:50K:/FR7630006000011234567890189
 JANE DOE RUE DE LA REPUBLIQUE
 PARIS FRANCE
 """
+else:
+    default_message = sample_cases[0]["raw_message"]
 
-raw_message = st.text_area("Message SWIFT brut", value=default_message, height=220)
+if "selected_sample_label" not in st.session_state:
+    st.session_state.selected_sample_label = sample_labels[0] if sample_labels else "Saisie manuelle"
+
+if "raw_message_input" not in st.session_state:
+    st.session_state.raw_message_input = default_message
+
+
+def _on_sample_change():
+    selected = next(
+        (case for case in sample_cases if case["label"] == st.session_state.selected_sample_label),
+        None,
+    )
+    if selected:
+        st.session_state.raw_message_input = selected["raw_message"]
+
+
+if sample_cases:
+    st.selectbox(
+        "Cas de test dataset",
+        options=sample_labels,
+        key="selected_sample_label",
+        on_change=_on_sample_change,
+    )
+
+raw_message = st.text_area("Message SWIFT brut", key="raw_message_input", height=220)
 message_id = st.text_input("Message ID", value="MSG_UI_001")
 slm_model = st.text_input("Modèle SLM", value="phi3:mini")
 
@@ -48,6 +89,17 @@ if run:
         elapsed = round(time.time() - start_time, 2)
         status_box.success(f"Pipeline terminé avec succès en {elapsed} s")
         info_box.caption("Résultat prêt. Consulte les onglets ci-dessous.")
+
+        if result.meta.rejected:
+            st.error(
+                "Message rejete : elements obligatoires manquants. "
+                "Le message doit etre corrige en entree avant traitement."
+            )
+            if result.meta.rejection_reasons:
+                for reason in result.meta.rejection_reasons:
+                    st.warning(reason)
+        else:
+            st.success("Message acceptable pour traitement metier.")
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Field type", result.field_type or "-")

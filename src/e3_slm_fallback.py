@@ -1,298 +1,629 @@
-"""e3_slm_fallback.py — Étape E3 : Fallback SLM local via Ollama"""
+# =============================================================================
+# e3_slm_fallback.py - VERSION CORRIGÉE ET OPTIMISÉE
+# Fallback SLM (Small Language Model) pour cas ambigus
+# OPTIMISATIONS: Cache, timeout court, prompt structuré, format clé:valeur
+# =============================================================================
 
-import json
 import re
-import urllib.request
-from typing import Dict, Optional
-
+import json
+import logging
+import hashlib
+import time
+from typing import Optional, Dict, Any, List
+import requests
+from src.config import OLLAMA_BASE_URL, OLLAMA_TIMEOUT_SECONDS, OLLAMA_MAX_RETRIES
 from src.models import CanonicalParty, CountryTown
-from src.config import OLLAMA_BASE_URL, OLLAMA_MODEL
-from src.reference_data import COUNTRY_NAME_TO_CODE, COUNTRY_CODES
+from src.reference_data import resolve_country_code
 
-OLLAMA_URL = f"{OLLAMA_BASE_URL}/api/generate"
-DEFAULT_MODEL = OLLAMA_MODEL
+logger = logging.getLogger(__name__)
 
 
-def _norm(value: Optional[str]) -> str:
+def _meta_get(meta: Any, field: str, default: Any = None) -> Any:
+    """Compat helper for CanonicalMeta instances and legacy dict metadata."""
+    if meta is None:
+        return default
+    if isinstance(meta, dict):
+        return meta.get(field, default)
+    return getattr(meta, field, default)
+
+
+def _meta_set(meta: Any, field: str, value: Any) -> None:
+    """Compat helper for CanonicalMeta instances and legacy dict metadata."""
+    if meta is None:
+        return
+    if isinstance(meta, dict):
+        meta[field] = value
+    else:
+        setattr(meta, field, value)
+
+
+def _looks_like_account_or_iban(value: Optional[str]) -> bool:
     if not value:
-        return ""
-    return re.sub(r"\s+", " ", value.strip())
+        return False
+    normalized = re.sub(r"[\s()/:-]+", "", value.upper())
+    if not normalized:
+        return False
+    return bool(re.fullmatch(r"[A-Z]{2}\d{10,34}", normalized))
 
 
-def _build_prompt(party: CanonicalParty) -> str:
-    country = party.country_town.country if party.country_town else ""
-    town = party.country_town.town if party.country_town else ""
-    return f"""
-You are a strict extraction assistant.
-
-Task:
-Correct only ambiguous fields in this SWIFT party block.
-
-Return EXACTLY 5 lines and nothing else:
-NAME=...
-ADDRESS=...
-COUNTRY=...
-TOWN=...
-IS_ORG=...
-
-Rules:
-- No markdown
-- No JSON
-- No explanation
-- No extra text
-- Keep values conservative
-- Do not invent new values
-- If uncertain, keep original values
-- ADDRESS must be one single line
-- IS_ORG must be true or false
-- COUNTRY must be ISO-2 if possible
-
-INPUT:
-NAME={" | ".join(party.name)}
-ADDRESS={" | ".join(party.address_lines)}
-COUNTRY={country}
-TOWN={town}
-IS_ORG={party.is_org}
-WARNINGS={" | ".join(party.meta.warnings)}
-""".strip()
+def _contains_account_text(value: Optional[str], account: Optional[str]) -> bool:
+    if not value or not account:
+        return False
+    left = re.sub(r"[\s()/:-]+", "", value.upper())
+    right = re.sub(r"[\s()/:-]+", "", account.upper())
+    return bool(right) and right in left
 
 
-def _call_ollama(prompt: str, model: str = DEFAULT_MODEL) -> str:
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": 0, "num_predict": 120},
+def _is_simple_country_only_gap(party: CanonicalParty, warnings: List[Any]) -> bool:
+    allowed = {
+        'pass1_town_missing',
+        'pass2_address_missing',
+        'town_missing',
     }
-    req = urllib.request.Request(
-        OLLAMA_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    normalized = {str(w) for w in warnings}
+    if not normalized:
+        return False
+    if any(w not in allowed and not w.startswith("country_conflict_iban_hint_only:") for w in normalized):
+        return False
+    return bool(party.country_town and party.country_town.country and not party.country_town.town)
+
+
+def _name_just_appends_same_country(current_name: str, slm_name: str, country_code: Optional[str]) -> bool:
+    if not current_name or not slm_name or not country_code:
+        return False
+    current = current_name.strip().upper()
+    candidate = slm_name.strip().upper()
+    if not candidate.startswith(current):
+        return False
+    suffix = candidate[len(current):].strip(" ,-/")
+    if not suffix:
+        return False
+    return resolve_country_code(suffix) == country_code
+
+
+# =============================================================================
+# CACHE SLM (évite les appels répétés)
+# =============================================================================
+
+class SLMCache:
+    """Cache simple pour les réponses SLM"""
+    
+    def __init__(self, max_size: int = 100):
+        self.cache = {}
+        self.max_size = max_size
+        self.hits = 0
+        self.misses = 0
+    
+    def _get_key(self, text: str) -> str:
+        """Génère une clé de cache"""
+        return hashlib.md5(text.encode()).hexdigest()[:16]
+    
+    def get(self, text: str) -> Optional[Dict[str, Any]]:
+        """Récupère du cache"""
+        key = self._get_key(text)
+        if key in self.cache:
+            self.hits += 1
+            logger.debug(f"[SLM Cache] Hit! ({self.hits} hits, {self.misses} misses)")
+            return self.cache[key]
+        self.misses += 1
+        return None
+    
+    def set(self, text: str, result: Dict[str, Any]):
+        """Stocke dans le cache"""
+        key = self._get_key(text)
+        # LRU simple: supprime l'entrée la plus ancienne si plein
+        if len(self.cache) >= self.max_size:
+            oldest_key = next(iter(self.cache))
+            del self.cache[oldest_key]
+        self.cache[key] = result
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Statistiques du cache"""
+        total = self.hits + self.misses
+        hit_rate = (self.hits / total * 100) if total > 0 else 0
+        return {
+            'hits': self.hits,
+            'misses': self.misses,
+            'hit_rate_percent': round(hit_rate, 1),
+            'size': len(self.cache)
+        }
+
+
+# Instance globale du cache
+_slm_cache = SLMCache(max_size=50)
+
+
+# =============================================================================
+# CLASSE PRINCIPALE: SLM Fallback
+# =============================================================================
+
+class E3SLMFallback:
+    """Fallback SLM optimisé pour corriger les cas ambigus"""
+    
+    def __init__(self, ollama_url: str = OLLAMA_BASE_URL, 
+                 model: str = "phi3:mini"):
+        self.ollama_url = ollama_url
+        self.model = model
+        self.timeout = OLLAMA_TIMEOUT_SECONDS
+        self.max_retries = OLLAMA_MAX_RETRIES
+        
+    # =====================================================================
+    # Point d'entrée principal
+    # =====================================================================
+    
+    def apply_fallback(self, party: CanonicalParty) -> CanonicalParty:
+        """
+        Applique le fallback SLM si nécessaire.
+        Retourne le party enrichi ou inchangé si SLM échoue.
+        """
+        # Vérifier si fallback nécessaire
+        if not self._needs_fallback(party):
+            logger.info("[E3] Fallback non nécessaire")
+            return party
+        
+        # Vérifier le cache
+        cache_key = party.raw or str(party.message_id)
+        cached = _slm_cache.get(cache_key)
+        if cached:
+            logger.info("[E3] Utilisation du cache SLM")
+            return self._apply_cached_result(party, cached)
+        
+        # Appeler le SLM
+        logger.info("[E3] Appel SLM en cours...")
+        slm_result = self._call_slm_optimized(party)
+        
+        if slm_result:
+            # Mettre en cache
+            _slm_cache.set(cache_key, slm_result)
+            # Appliquer le résultat
+            enriched = self._apply_slm_result(party, slm_result)
+            logger.info("[E3] SLM appliqué avec succès")
+            return enriched
+        else:
+            logger.warning("[E3] SLM a échoué, conservation du résultat original")
+            warnings = list(_meta_get(party.meta, 'warnings', []))
+            warnings.append('slm_failed')
+            _meta_set(party.meta, 'warnings', warnings)
+            return party
+    
+    # =====================================================================
+    # Détection intelligente du besoin de fallback
+    # =====================================================================
+    
+    def _needs_fallback(self, party: CanonicalParty) -> bool:
+        """
+        Détermine si le fallback SLM est nécessaire.
+        """
+        confidence = _meta_get(party.meta, 'parse_confidence', 0)
+        warnings = _meta_get(party.meta, 'warnings', [])
+        
+        # Pas besoin si déjà bonne confiance
+        if confidence >= 0.75:
+            return False
+
+        if _is_simple_country_only_gap(party, warnings):
+            return False
+        
+        # Liste des warnings qui justifient un fallback
+        fallback_triggers = [
+            'country_missing',
+            'country_not_found',
+            'town_missing',
+            'town_not_found',
+            'ambiguous_city_country',
+            'ambiguous_city_country_tail',
+            'name_address_mixed',
+            'pass1_country_missing',
+            'pass1_town_not_found',
+            'pass2_geo_incoherent',
+        ]
+        
+        needs_slm = any(
+            any(trigger in str(w) for trigger in fallback_triggers)
+            for w in warnings
+        )
+        
+        logger.debug(f"[E3] Fallback needed: {needs_slm} (confidence={confidence}, warnings={warnings})")
+        return needs_slm
+    
+    # =====================================================================
+    # Appel SLM optimisé
+    # =====================================================================
+    
+    def _call_slm_optimized(self, party: CanonicalParty) -> Optional[Dict[str, Any]]:
+        """
+        Appelle Ollama avec timeout court et retries.
+        """
+        prompt = self._build_structured_prompt(party)
+        
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.05,  # Très déterministe
+                "num_predict": 120,   # Réduit pour plus de rapidité
+                "stop": ["\n\n", "###", "---", "Input:", "Exemple:"],
+                "top_k": 5,
+                "top_p": 0.3,
+                "repeat_penalty": 1.1,
+            }
+        }
+        
+        for attempt in range(self.max_retries):
+            try:
+                start_time = time.time()
+                response = requests.post(
+                    f"{self.ollama_url}/api/generate",
+                    json=payload,
+                    timeout=(3, self.timeout)
+                )
+                elapsed = time.time() - start_time
+                
+                if response.status_code == 200:
+                    result_text = response.json().get("response", "").strip()
+                    logger.info(f"[E3] SLM réponse en {elapsed:.1f}s")
+                    return self._parse_slm_response(result_text)
+                else:
+                    logger.warning(f"[E3] HTTP {response.status_code}")
+                    
+            except requests.Timeout:
+                logger.warning(
+                    f"[E3] Timeout Ollama sur {self.ollama_url} "
+                    f"(tentative {attempt + 1}/{self.max_retries}, model={self.model}, timeout={self.timeout}s)"
+                )
+                if attempt == 0:
+                    # Réduire encore pour la retry
+                    payload["options"]["num_predict"] = 60
+                    
+            except requests.ConnectionError as e:
+                logger.error(f"[E3] Connection error: {e}")
+                break
+                
+            except Exception as e:
+                logger.error(f"[E3] Erreur: {e}")
+                break
+        
+        return None
+    
+    # =====================================================================
+    # Prompt structuré (format clé:valeur, plus rapide que JSON)
+    # =====================================================================
+    
+    def _build_structured_prompt(self, party: CanonicalParty) -> str:
+        """
+        Construit un prompt optimisé pour des réponses rapides et précises.
+        """
+        raw = party.raw or ""
+        field_type = party.field_type
+        current_warnings = _meta_get(party.meta, 'warnings', [])
+        
+        issues = ", ".join([str(w) for w in current_warnings[:3]]) if current_warnings else "aucun"
+        
+        prompt = f"""Extraire les informations de ce message bancaire SWIFT {field_type}.
+
+MESSAGE:
+{raw}
+
+PROBLÈMES DÉTECTÉS: {issues}
+
+RÈGLES:
+1. name = nom de la personne OU nom de l'entreprise (UNIQUEMENT le nom)
+2. address = rue, numéro, PO BOX, département, bâtiment (PAS la ville, PAS le pays)
+3. town = ville UNIQUEMENT (pas d'adresse, pas de pays, pas de code postal)
+4. country = code ISO à 2 lettres (FR, DE, CA, AE, TR, TN, MA, US, GB...)
+5. postal = code postal si présent (sinon -)
+
+RÉPONDRE UNIQUEMENT AU FORMAT SUIVANT (5 lignes exactement):
+name: <valeur>
+address: <valeur ou ->
+town: <valeur>
+country: <code ISO 2 lettres>
+postal: <valeur ou ->
+
+EXEMPLES:
+
+Input: "JANE DOE RUE DE LA PAIX\nPARIS\nFRANCE"
+name: JANE DOE
+address: RUE DE LA PAIX
+town: PARIS
+country: FR
+postal: -
+
+Input: "MOHSEN ISMAIL\nPO BOX 25026 EDUCATION DEPT ABU DHABI\nUNITED ARAB EMIRATES"
+name: MOHSEN ISMAIL
+address: PO BOX 25026 EDUCATION DEPT
+town: ABU DHABI
+country: AE
+postal: -
+
+Input: "BEN TALEB CHOKRI\n8846 RUE VALADE\nQUEBEC QC G1G6L5 CA"
+name: BEN TALEB CHOKRI
+address: 8846 RUE VALADE
+town: QUEBEC
+country: CA
+postal: G1G6L5
+
+Input: "LESAFFRE TURQUIE MAYACILIK URETI\nTURQUIE"
+name: LESAFFRE TURQUIE MAYACILIK URETI
+address: -
+town: -
+country: TR
+postal: -
+
+Maintenant extrais:
+"""
+        return prompt
+    
+    # =====================================================================
+    # Parsing de la réponse SLM (format clé:valeur)
+    # =====================================================================
+    
+    def _parse_slm_response(self, response: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse la réponse structurée (format clé:valeur).
+        Plus robuste que le JSON.
+        """
+        if not response:
+            return None
+        
+        result = {
+            'name': None,
+            'address_lines': [],
+            'town': None,
+            'country': None,
+            'postal_code': None
+        }
+        
+        lines = response.strip().split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if ':' in line:
+                key, value = line.split(':', 1)
+                key = key.strip().lower()
+                value = value.strip()
+                
+                # Ignorer les valeurs vides ou "-"
+                if not value or value == '-':
+                    continue
+                
+                if key == 'name':
+                    result['name'] = value.upper()
+                elif key == 'address':
+                    result['address_lines'] = [value.upper()]
+                elif key == 'town':
+                    result['town'] = value.upper()
+                elif key == 'country':
+                    # Normaliser le code pays
+                    country = value.upper()[:2]
+                    if len(country) == 2 and country.isalpha():
+                        result['country'] = country
+                elif key == 'postal':
+                    result['postal_code'] = value if value != '-' else None
+        
+        # Validation minimale
+        if not result['name']:
+            logger.warning("[E3] SLM n'a pas extrait de nom")
+            return None
+
+        result['address_lines'] = [
+            line for line in result['address_lines']
+            if not _looks_like_account_or_iban(line)
+        ]
+        if result['town'] and (
+            _looks_like_account_or_iban(result['town']) or resolve_country_code(result['town'])
+        ):
+            result['town'] = None
+        
+        return result
+    
+    # =====================================================================
+    # Application du résultat SLM
+    # =====================================================================
+    
+    def _apply_slm_result(self, party: CanonicalParty, 
+                          slm_result: Dict[str, Any]) -> CanonicalParty:
+        """
+        Fusionne le résultat SLM avec le party existant.
+        Stratégie conservative: ne remplace que si meilleur ou manquant.
+        """
+        updated = False
+        
+        # 1. Nom (toujours prendre le SLM si différent et plus complet)
+        if slm_result.get('name'):
+            current_name = ' '.join(party.name) if party.name else ''
+            slm_name = slm_result['name']
+            current_country = party.country_town.country if party.country_town else None
+            
+            # Prendre le SLM si le nom actuel est "UNKNOWN" ou très court
+            if _name_just_appends_same_country(current_name, slm_name, current_country):
+                pass
+            elif current_name == "UNKNOWN" or len(slm_name) > len(current_name):
+                party.name = [slm_name]
+                updated = True
+                logger.debug(f"[E3] Nom mis à jour: {slm_name}")
+        
+        # 2. Adresse (ajouter si manquante)
+        sanitized_addresses = [
+            line for line in slm_result.get('address_lines', [])
+            if not _contains_account_text(line, party.account)
+        ]
+        if sanitized_addresses and not party.address_lines:
+            party.address_lines = sanitized_addresses
+            updated = True
+            logger.debug(f"[E3] Adresse ajoutée: {sanitized_addresses}")
+        
+        # 3. Pays (priorité si manquant ou différent de l'IBAN)
+        if slm_result.get('country'):
+            if not party.country_town or not party.country_town.country:
+                party.country_town = CountryTown(
+                    country=slm_result['country'],
+                    town=party.country_town.town if party.country_town else None,
+                    postal_code=party.country_town.postal_code if party.country_town else None
+                )
+                updated = True
+                logger.debug(f"[E3] Pays ajouté: {slm_result['country']}")
+            elif party.country_town.country != slm_result['country']:
+                party.country_town.country = slm_result['country']
+                updated = True
+                logger.debug(f"[E3] Pays mis à jour: {slm_result['country']}")
+        
+        # 4. Ville (priorité si manquante ou contient adresse)
+        if slm_result.get('town'):
+            current_town = party.country_town.town if party.country_town else ''
+            slm_town = slm_result['town']
+            
+            # Prendre le SLM si la ville actuelle contient des mots d'adresse
+            address_keywords = ['PO BOX', 'RUE', 'STREET', 'AVENUE', 'DEPT', 'DEPARTMENT']
+            has_address_words = any(kw in current_town for kw in address_keywords)
+            
+            if not current_town or has_address_words or len(slm_town) < len(current_town):
+                if not party.country_town:
+                    party.country_town = CountryTown(country=None, town=slm_town, postal_code=None)
+                else:
+                    party.country_town.town = slm_town
+                updated = True
+                logger.debug(f"[E3] Ville mise à jour: {slm_town}")
+        
+        # 5. Code postal
+        if slm_result.get('postal_code'):
+            if party.country_town:
+                party.country_town.postal_code = slm_result['postal_code']
+                updated = True
+        
+        # Mise à jour des métadonnées
+        _meta_set(party.meta, 'llm_signals', ['slm_applied'])
+        _meta_set(party.meta, 'fallback_used', True)
+
+        if updated:
+            # Augmenter légèrement la confiance si SLM a amélioré
+            current_confidence = _meta_get(party.meta, 'parse_confidence', 0.5)
+            _meta_set(party.meta, 'parse_confidence', min(0.85, current_confidence + 0.15))
+            # Nettoyer les warnings résolus
+            _meta_set(party.meta, 'warnings', self._clean_resolved_warnings(party))
+        
+        return party
+    
+    def _apply_cached_result(self, party: CanonicalParty, 
+                             cached: Dict[str, Any]) -> CanonicalParty:
+        """Applique un résultat en cache"""
+        party = self._apply_slm_result(party, cached)
+        _meta_set(party.meta, 'llm_signals', ['slm_applied', 'slm_cached'])
+        return party
+    
+    def _clean_resolved_warnings(self, party: CanonicalParty) -> List[str]:
+        """Supprime les warnings qui ont été résolus par le SLM"""
+        warnings = _meta_get(party.meta, 'warnings', [])
+        cleaned = []
+        
+        for w in warnings:
+            w_str = str(w)
+            # Supprimer les warnings résolus
+            if party.country_town and party.country_town.country:
+                if 'country_missing' in w_str or 'country_not_found' in w_str:
+                    continue
+            if party.country_town and party.country_town.town:
+                if 'town_missing' in w_str or 'town_not_found' in w_str:
+                    continue
+            if party.name and party.name != ["UNKNOWN"]:
+                if 'name_missing' in w_str:
+                    continue
+            cleaned.append(w)
+        
+        return cleaned
+    
+    # =====================================================================
+    # Utilitaires
+    # =====================================================================
+    
+    @staticmethod
+    def get_cache_stats() -> Dict[str, int]:
+        """Retourne les statistiques du cache"""
+        return _slm_cache.get_stats()
+    
+    @staticmethod
+    def clear_cache():
+        """Vide le cache"""
+        _slm_cache.cache.clear()
+        _slm_cache.hits = 0
+        _slm_cache.misses = 0
+        logger.info("[E3] Cache SLM vidé")
+
+
+# =============================================================================
+# Fonction de compatibilité (pour l'ancien code)
+# =============================================================================
+
+def llm_fallback_50K(raw: str, field_type: str, current_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fonction legacy pour compatibilité.
+    Convertit le dict en CanonicalParty, applique le fallback, retourne le dict.
+    """
+    from src.models import CanonicalMeta
+    
+    # Convertir dict en CanonicalParty
+    party = CanonicalParty(
+        message_id=current_result.get('message_id', 'MSG_001'),
+        field_type=field_type,
+        role=current_result.get('role', 'debtor'),
+        raw=raw,
+        account=current_result.get('account'),
+        party_id=current_result.get('party_id'),
+        name=current_result.get('name', ['UNKNOWN']),
+        address_lines=current_result.get('address_lines', []),
+        country_town=current_result.get('country_town'),
+        dob=current_result.get('dob'),
+        pob=current_result.get('pob'),
+        org_id=current_result.get('org_id'),
+        national_id=current_result.get('national_id'),
+        postal_complement=current_result.get('postal_complement'),
+        is_org=current_result.get('is_org', False),
+        meta=CanonicalMeta(**current_result.get('meta', {
+            'source_format': field_type,
+            'parse_confidence': 0.5,
+            'warnings': [],
+            'llm_signals': [],
+            'fallback_used': False
+        })),
+        address_validation=current_result.get('address_validation', [])
     )
-    with urllib.request.urlopen(req, timeout=180) as response:
-        body = response.read().decode("utf-8")
-    data = json.loads(body)
-    return data.get("response", "").strip()
+    
+    # Appliquer le fallback
+    fallback = E3SLMFallback()
+    enriched = fallback.apply_fallback(party)
+    
+    # Retourner comme dict (pour compatibilité)
+    return enriched.to_dict() if hasattr(enriched, 'to_dict') else enriched.__dict__
 
 
-def _strip_code_fences(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r"^```[a-zA-Z0-9]*\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return text.strip()
-
-
-def _parse_key_value_response(text: str) -> Dict[str, str]:
-    result: Dict[str, str] = {}
-    cleaned = _strip_code_fences(text)
-    for line in cleaned.splitlines():
-        line = line.strip()
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        result[key.strip().upper()] = value.strip()
-    return result
-
-
-def _normalize_country_value(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    raw = _norm(value).upper()
-    if raw in COUNTRY_CODES:
-        return raw
-    return COUNTRY_NAME_TO_CODE.get(raw)
-
-
-def _clean_address_value(address: Optional[str], town: Optional[str], country: Optional[str]) -> Optional[str]:
-    if not address:
-        return None
-    cleaned = address.strip()
-    variants = set()
-    if town:
-        variants.add(_norm(town))
-        variants.add(_norm(town).upper())
-    if country:
-        variants.add(_norm(country))
-        variants.add(_norm(country).upper())
-        upper_country = _norm(country).upper()
-        if upper_country in COUNTRY_CODES:
-            for alias, code in COUNTRY_NAME_TO_CODE.items():
-                if code == upper_country:
-                    variants.add(alias)
-                    variants.add(alias.upper())
-    for value in variants:
-        if value:
-            cleaned = re.sub(rf"\b{re.escape(value)}\b", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*,\s*,", ",", cleaned)
-    cleaned = re.sub(r"\s+,", ",", cleaned)
-    cleaned = re.sub(r",\s+", ", ", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    cleaned = cleaned.strip(" ,")
-    return cleaned or None
-
-
-def _value_is_grounded(candidate: Optional[str], party: CanonicalParty) -> bool:
-    if not candidate:
-        return False
-    c = _norm(candidate).upper()
-    if not c:
-        return False
-    evidence_parts = []
-    evidence_parts.extend(party.name)
-    evidence_parts.extend(party.address_lines)
-    if party.country_town:
-        if party.country_town.country:
-            evidence_parts.append(party.country_town.country)
-        if party.country_town.town:
-            evidence_parts.append(party.country_town.town)
-    evidence = " ".join(_norm(x).upper() for x in evidence_parts if x)
-    if c in evidence:
-        return True
-    normalized_country = _normalize_country_value(candidate)
-    if normalized_country and party.country_town and party.country_town.country:
-        if normalized_country == _norm(party.country_town.country).upper():
-            return True
-    return False
-
-
-def _is_better_name(current: list, candidate: Optional[str]) -> bool:
-    if not candidate:
-        return False
-    if not current:
-        return True
-    current_joined = _norm(" ".join(current))
-    candidate = _norm(candidate)
-    if not candidate:
-        return False
-    return candidate.upper() != current_joined.upper()
-
-
-def _is_better_address(current: list, candidate: Optional[str]) -> bool:
-    if not candidate:
-        return False
-    if not current:
-        return True
-    current_joined = _norm(" | ".join(current))
-    candidate = _norm(candidate)
-    if not candidate:
-        return False
-    return candidate.upper() != current_joined.upper()
+def detect_ambiguity(raw: str, current_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fonction legacy pour compatibilité.
+    """
+    warnings = current_result.get('meta', {}).get('warnings', [])
+    
+    fallback_triggers = [
+        'country_missing', 'town_missing', 'ambiguous_city_country',
+        'name_address_mixed', 'pass1_country_missing', 'pass1_town_not_found'
+    ]
+    
+    is_ambiguous = any(
+        any(trigger in str(w) for trigger in fallback_triggers)
+        for w in warnings
+    )
+    
+    return {
+        'is_ambiguous': is_ambiguous,
+        'signals': warnings
+    }
 
 
 def needs_slm_fallback(party: CanonicalParty) -> bool:
-    warnings = set(party.meta.warnings)
-
-    if (
-        not party.address_lines
-        and party.country_town is not None
-        and party.country_town.country
-        and party.country_town.town
-        and party.meta.parse_confidence >= 0.75
-    ):
-        return False
-
-    if (
-        party.address_lines
-        and party.country_town is not None
-        and party.country_town.country
-        and party.country_town.town
-        and party.meta.parse_confidence >= 0.75
-    ):
-        return False
-
-    strong_triggers = [
-        "name_address_mixed",
-        "town_reclassified_as_address",
-        "semantic_unknown_town_for_country",
-        "semantic_no_valid_address_detected",
-        "invalid_structured_line_3",
-        "ambiguous_city_country_tail",
-    ]
-
-    if any(any(w.startswith(t) for t in strong_triggers) for w in warnings):
-        return True
-
-    if any(w.startswith("multiline_name_fused") for w in warnings):
-        if party.meta.parse_confidence < 0.75:
-            return True
-
-    if party.meta.parse_confidence < 0.70:
-        return True
-
-    return False
+    """Compatibility wrapper expected by pipeline.py."""
+    return E3SLMFallback()._needs_fallback(party)
 
 
-def apply_slm_fallback(party: CanonicalParty, model: str = DEFAULT_MODEL) -> CanonicalParty:
-    try:
-        prompt = _build_prompt(party)
-        raw_response = _call_ollama(prompt, model=model)
-        parsed = _parse_key_value_response(raw_response)
-
-        current_country = party.country_town.country if party.country_town else None
-        current_town = party.country_town.town if party.country_town else None
-
-        slm_name = parsed.get("NAME")
-        slm_address = parsed.get("ADDRESS")
-        slm_country_raw = parsed.get("COUNTRY")
-        slm_country = _normalize_country_value(slm_country_raw)
-        slm_town = parsed.get("TOWN")
-        slm_is_org = parsed.get("IS_ORG")
-
-        final_country = current_country
-        final_town = current_town
-
-        if slm_name and _value_is_grounded(slm_name, party) and _is_better_name(party.name, slm_name):
-            party.name = [_norm(slm_name)]
-
-        if slm_country:
-            final_country = slm_country
-
-        if slm_town and _value_is_grounded(slm_town, party):
-            cand = _norm(slm_town)
-            if current_town:
-                cur = _norm(current_town)
-                if cand.upper() == cur.upper() or len(cand) >= len(cur):
-                    final_town = cand
-            else:
-                final_town = cand
-
-        cleaned_address = _clean_address_value(
-            slm_address, town=final_town, country=slm_country_raw or final_country
-        )
-
-        if party.address_lines:
-            if (
-                cleaned_address
-                and _value_is_grounded(cleaned_address, party)
-                and _is_better_address(party.address_lines, cleaned_address)
-            ):
-                party.address_lines = [cleaned_address]
-
-        if final_country or final_town:
-            if party.country_town is None:
-                party.country_town = CountryTown(country=final_country, town=final_town, postal_code=None)
-            else:
-                if final_country:
-                    party.country_town.country = final_country
-                if final_town:
-                    party.country_town.town = final_town
-
-        if slm_is_org:
-            val = _norm(slm_is_org).lower()
-            if val == "true":
-                party.is_org = True
-            elif val == "false":
-                party.is_org = False
-
-        party.meta.fallback_used = True
-        if "slm_applied" not in party.meta.llm_signals:
-            party.meta.llm_signals.append("slm_applied")
-        party.meta.parse_confidence = min(1.0, round(party.meta.parse_confidence + 0.05, 2))
-
-    except Exception as e:
-        err = f"slm_error:{type(e).__name__}"
-        if err not in party.meta.llm_signals:
-            party.meta.llm_signals.append(err)
-
-    return party
+def apply_slm_fallback(party: CanonicalParty, model: str = "phi3:mini") -> CanonicalParty:
+    """Compatibility wrapper expected by pipeline.py."""
+    return E3SLMFallback(model=model).apply_fallback(party)

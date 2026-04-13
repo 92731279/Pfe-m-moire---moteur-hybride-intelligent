@@ -152,6 +152,59 @@ def town_known_for_country(country: Optional[str], town: Optional[str]) -> bool:
     return False
 
 
+def reduce_to_known_core_toponym(
+    country: Optional[str],
+    town: Optional[str],
+) -> Optional[str]:
+    """
+    Réduit un toponyme composé vers une ville coeur connue pour le pays.
+    Exemples:
+    - "TUNIS BELVEDERE" -> "TUNIS"
+    - "PARIS CENTRE" -> "PARIS"
+
+    La réduction reste conservative:
+    - on ne travaille que dans le pays fourni
+    - on cherche d'abord les sous-toponymes les plus longs
+    - on ne retourne qu'une ville déjà connue dans nos référentiels
+    """
+    if not country or not town:
+        return None
+
+    country_n = _basic_normalize(country)
+    town_n = _basic_normalize(town)
+    if not town_n or country_n not in COUNTRY_TOPONYM_INDEX:
+        return None
+
+    known_cities = COUNTRY_TOPONYM_INDEX[country_n]
+
+    # Si déjà connu, on renvoie la forme canonique correspondante.
+    for known in known_cities:
+        if toponyms_equivalent(town_n, known):
+            return known
+
+    tokens = town_n.split()
+    if len(tokens) < 2:
+        return None
+
+    candidates = []
+
+    # Sous-chaînes contiguës, en privilégiant les plus longues.
+    for size in range(len(tokens) - 1, 0, -1):
+        for start in range(0, len(tokens) - size + 1):
+            candidates.append(" ".join(tokens[start:start + size]))
+
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        for known in known_cities:
+            if toponyms_equivalent(candidate, known):
+                return known
+
+    return None
+
+
 def find_variant_match_in_address(address_lines: List[str], town: Optional[str]) -> Optional[Tuple[str, str]]:
     if not town:
         return None

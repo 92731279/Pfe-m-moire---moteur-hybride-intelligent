@@ -3,11 +3,12 @@
 from typing import Dict, Set, List, Optional, Tuple
 
 from src.models import CanonicalParty
-from src.reference_data import CITIES_BY_COUNTRY
+from src.reference_data import CITIES_BY_COUNTRY, COUNTRY_CODES
 from src.e2_address_parser import parse_address_line
 from src.toponym_normalizer import (
     canonicalize_toponym, town_known_for_country,
-    find_variant_match_in_address, toponyms_equivalent,
+    find_variant_match_in_address, reduce_to_known_core_toponym,
+    toponyms_equivalent,
 )
 # Ajouter après les imports existants
 try:
@@ -16,7 +17,7 @@ try:
     print("✅ GeoNames disponible")
 except Exception as e:
     GEONAMES_AVAILABLE = False
-VALID_COUNTRIES: Set[str] = set(CITIES_BY_COUNTRY.keys())
+VALID_COUNTRIES: Set[str] = set(COUNTRY_CODES)
 
 
 def _norm(value: Optional[str]) -> str:
@@ -104,31 +105,46 @@ def _validate_pass1_country_town(
                     f"pass1_town_validated_geonames:{matched_via}"
                 )
             else:
-                # Fallback toponym_normalizer
-                variant = find_variant_match_in_address(
-                    party.address_lines, geo.town
-                )
-                if variant:
-                    observed, canonical_t = variant
-                    geo.town = canonical_t
-                    town = _norm(canonical_t)
+                reduced_town = reduce_to_known_core_toponym(country, geo.town)
+                if reduced_town:
                     geo_coherent = True
                     _append_warning_once(
                         warnings,
-                        f"pass1_town_variant_matched:{observed}→{canonical_t}",
+                        f"pass1_town_validated_via_core:{country}:{_norm(geo.town)}→{_norm(reduced_town)}",
                     )
+                # Fallback toponym_normalizer
                 else:
-                    # Ville non trouvée nulle part
-                    _append_warning_once(
-                        warnings,
-                        f"pass1_town_not_found_worldwide:{country}:{town}",
+                    variant = find_variant_match_in_address(
+                        party.address_lines, geo.town
                     )
-                    party.meta.parse_confidence = min(
-                        party.meta.parse_confidence, 0.60
-                    )
+                    if variant:
+                        observed, canonical_t = variant
+                        geo.town = canonical_t
+                        town = _norm(canonical_t)
+                        geo_coherent = True
+                        _append_warning_once(
+                            warnings,
+                            f"pass1_town_variant_matched:{observed}→{canonical_t}",
+                        )
+                    else:
+                        # Ville non trouvée nulle part
+                        _append_warning_once(
+                            warnings,
+                            f"pass1_town_not_found_worldwide:{country}:{town}",
+                        )
+                        party.meta.parse_confidence = min(
+                            party.meta.parse_confidence, 0.60
+                        )
         else:
             # Fallback sans GeoNames
-            if town_known_for_country(country, town):
+            reduced_town = reduce_to_known_core_toponym(country, geo.town)
+            if reduced_town:
+                geo_coherent = True
+                _append_warning_once(
+                    warnings,
+                    f"pass1_town_validated_via_core:{country}:{_norm(geo.town)}→{_norm(reduced_town)}",
+                )
+            elif town_known_for_country(country, town):
                 geo.town = canonicalize_toponym(geo.town)
                 town = _norm(geo.town)
                 geo_coherent = True

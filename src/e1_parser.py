@@ -4,12 +4,12 @@ import re
 from typing import List, Optional, Tuple
 
 from src.models import (
-    CanonicalParty, CanonicalMeta, CountryTown, PlaceOfBirth,
+    CanonicalParty, CanonicalMeta, CountryTown, DateOfBirth, PlaceOfBirth,
     PartyIdentifier, PreprocessResult,
 )
 from src.reference_data import (
     COUNTRY_NAME_TO_CODE, COUNTRY_CODES, ADDRESS_KEYWORDS, ORG_HINTS,
-    PARTY_ID_PREFIXES, CAPITALS, CITIES_BY_COUNTRY,
+    PARTY_ID_PREFIXES, CITIES_BY_COUNTRY, resolve_country_code,
 )
 from src.ambiguity_resolver import resolve_city_country_ambiguity
 
@@ -20,11 +20,12 @@ def _norm(value: Optional[str]) -> str:
     return re.sub(r"\s+", " ", value.strip())
 
 
-def _empty(field_type: str, role: str, message_id: str) -> CanonicalParty:
+def _empty(field_type: str, role: str, message_id: str, raw: Optional[str] = None) -> CanonicalParty:
     return CanonicalParty(
         message_id=message_id,
         field_type=field_type,
         role=role,
+        raw=raw,
         meta=CanonicalMeta(source_format=field_type, parse_confidence=0.0),
     )
 
@@ -41,16 +42,47 @@ KNOWN_CITIES = _all_known_cities_upper()
 
 
 def _is_known_country_name(line: str) -> bool:
-    return _norm(line).upper() in COUNTRY_NAME_TO_CODE
+    return resolve_country_code(line) is not None
 
 
 def _is_known_city(line: str) -> bool:
     return _norm(line).upper() in KNOWN_CITIES
 
 
+def _contains_address_keyword(value: str) -> bool:
+    up = _norm(value).upper()
+    if not up:
+        return False
+    for keyword in ADDRESS_KEYWORDS:
+        pattern = rf"\b{re.escape(keyword)}\b"
+        if re.search(pattern, up):
+            return True
+    return False
+
+
+def _parse_country_encoded_line(line: str) -> Optional[CountryTown]:
+    raw = _norm(line)
+    if "/" not in raw:
+        return None
+
+    left, right = [part.strip() for part in raw.split("/", 1)]
+    if not left or not right:
+        return None
+
+    country_code = left.upper()
+    if country_code not in COUNTRY_CODES:
+        return None
+
+    encoded_country = resolve_country_code(right)
+    if encoded_country == country_code:
+        return CountryTown(country=country_code, town=None, postal_code=None)
+
+    return CountryTown(country=country_code, town=right, postal_code=None)
+
+
 def _is_address(line: str) -> bool:
     up = _norm(line).upper()
-    if any(k in up for k in ADDRESS_KEYWORDS):
+    if _contains_address_keyword(up):
         return True
     if re.search(r"\d", up):
         return True
@@ -61,7 +93,7 @@ def _looks_like_real_address_fragment(value: str) -> bool:
     up = _norm(value).upper()
     if not up:
         return False
-    has_keyword = any(k in up for k in ADDRESS_KEYWORDS)
+    has_keyword = _contains_address_keyword(up)
     has_digit = bool(re.search(r"\d", up))
     if has_keyword:
         return True
@@ -149,22 +181,69 @@ def _parse_party_identifier(raw: str) -> PartyIdentifier:
             identifier = parts[-1]
     return PartyIdentifier(code=code, country=country, issuer=issuer, identifier=identifier)
 
-
 def _split_embedded_country_prefix(line: str) -> Tuple[Optional[str], str]:
     raw = _norm(line)
     up = raw.upper()
+
     if len(up) < 4:
         return None, raw
+
     prefix = up[:2]
     if prefix not in COUNTRY_CODES:
         return None, raw
-    if re.match(r"^(BER|BEL|BEN|BRU)", up):
+
+    # PROTECTION étendue — villes connues commençant par un code pays
+    PROTECTED_PREFIXES = (
+        # PA → PARIS, PALERMO, PADOVA...
+        "PAR", "PAL", "PAD", "PAN", "PAM",
+        # MA → MADRID, MARSEILLE, MANCHESTER...
+        "MAD", "MAR", "MAN", "MAL",
+        # BE → BERLIN, BELGRADE, BEIRUT...
+        "BER", "BEL", "BEN", "BRU", "BEI",
+        # IT → ISTANBUL...
+        "IST",
+        # IN → INDIA cities
+        "IND",
+        # IR → IRELAND cities
+        "IRE",
+        # NO → NORDIC cities
+        "NOR",
+        # LI → LIMA, LISBON...
+        "LIM", "LIS",
+        # TO → TOKYO, TORONTO...
+        "TOK", "TOR",
+        # SI → SINGAPORE...
+        "SIN", "SIG",
+        # LA → LAGOS, LAHORE...
+        "LAG", "LAH",
+        # NA → NAIROBI, NAPLES...
+        "NAI", "NAP",
+        # GE → GENEVA, GENOA...
+        "GEN",
+        # BR → BRUSSELS, BRUSSELS...
+        "BRU", "BRE",
+        # RI → RIGA, RICHMOND...
+        "RIG", "RIC",
+        # MT → MALTA (pays ET ville)
+        "MAL",
+    )
+    if up.startswith(PROTECTED_PREFIXES):
         return None, raw
+
+    # NOUVEAU — vérifier que le reste ressemble à un nom de ville
     rest = raw[2:].strip(" ,-/")
     if not rest:
         return None, raw
-    return prefix, rest
 
+    # Si le reste est trop court (< 2 chars) → probablement pas une ville
+    if len(rest) < 2:
+        return None, raw
+
+    # Si le mot entier est une ville connue → ne pas splitter
+    if _norm(up) in KNOWN_CITIES:
+        return None, raw
+
+    return prefix, rest
 
 def _split_inline_name_address(line: str) -> Tuple[str, Optional[str]]:
     raw = _norm(line)
@@ -227,23 +306,55 @@ def _parse_place_of_birth(value: str) -> PlaceOfBirth:
     return PlaceOfBirth(country=None, city=raw or None)
 
 
+def _parse_date_of_birth(value: str) -> DateOfBirth:
+    raw = _norm(value)
+    if re.fullmatch(r"\d{8}", raw):
+        return DateOfBirth(
+            raw=raw,
+            year=raw[:4],
+            month=raw[4:6],
+            day=raw[6:8],
+        )
+    return DateOfBirth(raw=raw)
+
 def _extract_country_postal_town_fragment(line: str) -> Optional[Tuple[int, int, CountryTown]]:
     raw = _norm(line)
+
     patterns = [
+        # Standard : FR/75002 PARIS ou FR 75002 PARIS
         r"\b([A-Z]{2})/(\d{3,10})\s+([A-Z0-9()' .\-]+)$",
         r"\b([A-Z]{2})\s+(\d{3,10})\s+([A-Z0-9()' .\-]+)$",
+
+        # ✅ NOUVEAU — Format belge/suisse : B -6600 BASTOGNE ou BE-6600 BASTOGNE
+        r"\b([A-Z]{1,2})\s*[-–]\s*(\d{3,10})\s+([A-Z][A-Z0-9()' .\-]+)$",
+
+        # ✅ NOUVEAU — Format /FR\n66000 PERPIGNAN
+        r"^([A-Z]{2})/(\d{3,10})\s+([A-Z][A-Z0-9()' .\-]+)$",
+
+        # ✅ NOUVEAU — Format DE 65929 FRANKFURT HESSEN
+        r"^([A-Z]{2})\s+(\d{3,10})\s+([A-Z][A-Z0-9()' .\-\s]+)$",
     ]
+
     for pattern in patterns:
         m = re.search(pattern, raw, flags=re.IGNORECASE)
         if not m:
             continue
-        cc = m.group(1).upper()
+        cc = m.group(1).upper().strip("-– ")
+        # Normaliser code pays court (B → BE, D → DE, F → FR, I → IT, E → ES)
+        SHORT_TO_ISO = {
+            "B": "BE", "D": "DE", "F": "FR", "I": "IT",
+            "E": "ES", "L": "LU", "A": "AT", "S": "SE",
+            "N": "NO", "P": "PT", "G": "GR",
+        }
+        if len(cc) == 1:
+            cc = SHORT_TO_ISO.get(cc, cc)
+        if cc not in COUNTRY_CODES:
+            continue
         pc = m.group(2)
         town = _norm(m.group(3))
-        if cc in COUNTRY_CODES:
-            return m.start(), m.end(), CountryTown(country=cc, town=town, postal_code=pc)
-    return None
+        return m.start(), m.end(), CountryTown(country=cc, town=town, postal_code=pc)
 
+    return None
 
 def _extract_geo_from_free_lines(lines: List[str], warnings: List[str]) -> Tuple[CountryTown, int]:
     if not lines:
@@ -252,12 +363,43 @@ def _extract_geo_from_free_lines(lines: List[str], warnings: List[str]) -> Tuple
     last = _norm(lines[-1])
     up = last.upper()
 
+    encoded = _parse_country_encoded_line(last)
+    if encoded:
+        if encoded.town is None:
+            return encoded, 1
+        if _is_known_country_name(encoded.town):
+            return CountryTown(country=encoded.country, town=None, postal_code=None), 1
+
+    # Protection prioritaire: une ville connue seule en dernière ligne
+    # ne doit jamais être découpée en faux couple pays/ville ("PARIS" -> "PA"/"RIS").
+    if _is_known_city(last):
+        return CountryTown(country=None, town=last, postal_code=None), 1
+
     frag = _extract_country_postal_town_fragment(last)
     if frag:
         start_idx, end_idx, ct = frag
         frag_text = _norm(last[start_idx:end_idx])
         if _norm(last).upper() == frag_text.upper():
             return ct, 1
+
+    code = resolve_country_code(last)
+    if code:
+        if len(lines) >= 2:
+            prev = _norm(lines[-2])
+            frag_prev = _extract_country_postal_town_fragment(prev)
+            if frag_prev:
+                start_idx, end_idx, ct_prev = frag_prev
+                frag_text = _norm(prev[start_idx:end_idx])
+                if _norm(prev).upper() == frag_text.upper():
+                    if ct_prev.country == code or ct_prev.country is None:
+                        ct_prev.country = code
+                    return ct_prev, 2
+            m = re.match(r"^(\d{4,6})\s+(.+)$", prev)
+            if m:
+                return CountryTown(country=code, town=m.group(2).strip(), postal_code=m.group(1).strip()), 2
+            if prev and _is_known_city(prev):
+                return CountryTown(country=code, town=prev, postal_code=None), 2
+        return CountryTown(country=code, town=None, postal_code=None), 1
 
     for name, code in COUNTRY_NAME_TO_CODE.items():
         if up == name:
@@ -286,18 +428,43 @@ def _extract_geo_from_free_lines(lines: List[str], warnings: List[str]) -> Tuple
 
     embedded_country, cleaned_town = _split_embedded_country_prefix(last)
     if embedded_country and cleaned_town:
+        cleaned_country = resolve_country_code(cleaned_town)
+        if cleaned_country == embedded_country:
+            return CountryTown(country=embedded_country, town=None, postal_code=None), 1
         warnings.append(f"country_embedded_in_town_line:{embedded_country}")
         return CountryTown(country=embedded_country, town=cleaned_town, postal_code=None), 1
 
     m = re.match(r"^(\d{4,6})\s+(.+)$", last)
     if m:
         return CountryTown(country=None, town=m.group(2).strip(), postal_code=m.group(1).strip()), 1
-
+    # Dans _extract_geo_from_free_lines, avant le return final
+    # ✅ NOUVEAU — Format pays court + tiret + code postal + ville
+    # Ex: "B -6600 BASTOGNE", "CH 8832 WOLLERAU", "DE 65929 FRANKFURT"
+    m_short = re.match(
+        r"^([A-Z]{1,2})\s*[-–]?\s*(\d{4,6})\s+(.+)$",
+        last,
+        flags=re.IGNORECASE
+    )
+    if m_short:
+        cc = m_short.group(1).upper().strip()
+        SHORT_TO_ISO = {
+            "B": "BE", "D": "DE", "F": "FR", "I": "IT",
+            "E": "ES", "L": "LU", "A": "AT", "S": "SE",
+        }
+        if len(cc) == 1:
+            cc = SHORT_TO_ISO.get(cc, cc)
+        if cc in COUNTRY_CODES:
+            warnings.append(f"short_country_code_normalized:{m_short.group(1)}→{cc}")
+            return CountryTown(
+                country=cc,
+                town=_norm(m_short.group(3)),
+                postal_code=m_short.group(2),
+            ), 1
     return CountryTown(country=None, town=last, postal_code=None), 1
 
-
+    
 def parse_free_party_field(pre: PreprocessResult, field_type: str, role: str, message_id: str) -> CanonicalParty:
-    res = _empty(field_type, role, message_id)
+    res = _empty(field_type, role, message_id, raw=pre.normalized_text or pre.raw_input)
     warnings = res.meta.warnings
     lines = pre.lines[:]
     idx = 0
@@ -325,9 +492,6 @@ def parse_free_party_field(pre: PreprocessResult, field_type: str, role: str, me
                     res.name = [left]
                     res.country_town = CountryTown(country=country_code, town=None, postal_code=None)
                     warnings.append("town_missing_from_name_country_pattern")
-                    if pre.meta.iban_country and not res.country_town.country:
-                        res.country_town.country = pre.meta.iban_country
-                        warnings.append("country_from_iban")
                     res.is_org = _detect_org(res.name)
                     res.meta.parse_confidence = 0.85
                     return res
@@ -355,11 +519,6 @@ def parse_free_party_field(pre: PreprocessResult, field_type: str, role: str, me
         if pre.meta.iban_country and not res.country_town.country:
             res.country_town.country = pre.meta.iban_country
             warnings.append("country_from_iban")
-        if res.country_town.country and not res.country_town.town:
-            capital = CAPITALS.get(res.country_town.country)
-            if capital:
-                res.country_town.town = capital
-                warnings.append(f"town_inferred_from_capital:{res.country_town.country}→{capital}")
         res.address_lines = _deduplicate_addresses(res.address_lines)
         res.is_org = _detect_org(res.name)
         res.meta.parse_confidence = 0.80
@@ -400,11 +559,12 @@ def parse_free_party_field(pre: PreprocessResult, field_type: str, role: str, me
     if len(remaining) == 2:
         line1 = _norm(remaining[0])
         line2 = _norm(remaining[1]).upper()
-        if line2 in COUNTRY_NAME_TO_CODE:
+        line2_country = resolve_country_code(line2)
+        if line2_country:
             m = re.match(r"^(\d{4,6})\s+(.+)$", line1)
             if m:
                 res.country_town = CountryTown(
-                    country=COUNTRY_NAME_TO_CODE[line2],
+                    country=line2_country,
                     town=m.group(2).strip(),
                     postal_code=m.group(1).strip(),
                 )
@@ -415,7 +575,7 @@ def parse_free_party_field(pre: PreprocessResult, field_type: str, role: str, me
 
             decision = resolve_city_country_ambiguity(line1, line2)
             if decision.label == "TOWN":
-                res.country_town = CountryTown(country=COUNTRY_NAME_TO_CODE[line2], town=line1, postal_code=None)
+                res.country_town = CountryTown(country=line2_country, town=line1, postal_code=None)
                 res.address_lines = _deduplicate_addresses(res.address_lines)
                 warnings.append(f"ambiguous_city_country_tail_resolved_as_town:{decision.reason}")
                 res.is_org = _detect_org(res.name)
@@ -423,13 +583,13 @@ def parse_free_party_field(pre: PreprocessResult, field_type: str, role: str, me
                 return res
             if decision.label == "ADDRESS":
                 res.address_lines.append(line1)
-                res.country_town = CountryTown(country=COUNTRY_NAME_TO_CODE[line2], town=None, postal_code=None)
+                res.country_town = CountryTown(country=line2_country, town=None, postal_code=None)
                 res.address_lines = _deduplicate_addresses(res.address_lines)
                 warnings.append(f"ambiguous_city_country_tail_resolved_as_address:{decision.reason}")
                 res.is_org = _detect_org(res.name)
                 res.meta.parse_confidence = decision.confidence
                 return res
-            res.country_town = CountryTown(country=COUNTRY_NAME_TO_CODE[line2], town=line1, postal_code=None)
+            res.country_town = CountryTown(country=line2_country, town=line1, postal_code=None)
             res.address_lines = _deduplicate_addresses(res.address_lines)
             warnings.append("ambiguous_city_country_tail")
             res.is_org = _detect_org(res.name)
@@ -439,7 +599,7 @@ def parse_free_party_field(pre: PreprocessResult, field_type: str, role: str, me
     # analyser les lignes restantes
     for line in remaining:
         line = _norm(line)
-        # ✅ NOUVEAU : ignorer les lignes redondantes avec geo déjà extrait
+        # ignorer les lignes redondantes avec geo déjà extrait
         if _is_postal_town_line(line, geo):
             continue
         frag = _extract_country_postal_town_fragment(line)
@@ -457,9 +617,10 @@ def parse_free_party_field(pre: PreprocessResult, field_type: str, role: str, me
             continue
         if geo.town and _norm(line).upper() == _norm(geo.town).upper():
             continue
-        if line.upper() in COUNTRY_NAME_TO_CODE:
+        line_country = resolve_country_code(line)
+        if line_country:
             if not geo.country:
-                geo.country = COUNTRY_NAME_TO_CODE[line.upper()]
+                geo.country = line_country
             continue
         if _is_address(line):
             res.address_lines.append(line)
@@ -473,16 +634,23 @@ def parse_free_party_field(pre: PreprocessResult, field_type: str, role: str, me
         geo.town = None
         warnings.append("town_reclassified_as_address")
 
+    detected_country_from_town = resolve_country_code(geo.town) if geo.town else None
+    if detected_country_from_town:
+        if not geo.country:
+            geo.country = detected_country_from_town
+            warnings.append("country_reclassified_from_town_line")
+        if geo.country == detected_country_from_town:
+            geo.town = None
+
+    # CORRECTION CRITIQUE : IBAN prime sur tout
     if pre.meta.iban_country:
         if not geo.country:
             geo.country = pre.meta.iban_country
             warnings.append("country_from_iban")
-
-    if geo.country and not geo.town:
-        capital = CAPITALS.get(geo.country)
-        if capital:
-            geo.town = capital
-            warnings.append(f"town_inferred_from_capital:{geo.country}→{capital}")
+        elif geo.country != pre.meta.iban_country:
+            warnings.append(
+                f"country_conflict_iban_hint_only:{pre.meta.iban_country}!=explicit:{geo.country}"
+            )
 
     res.address_lines = _deduplicate_addresses(res.address_lines)
     res.country_town = geo
@@ -509,7 +677,7 @@ def parse_free_party_field(pre: PreprocessResult, field_type: str, role: str, me
 
 
 def parse_structured_50F(pre: PreprocessResult, message_id: str = "MSG") -> CanonicalParty:
-    res = _empty("50F", "debtor", message_id)
+    res = _empty("50F", "debtor", message_id, raw=pre.normalized_text or pre.raw_input)
     warnings = res.meta.warnings
     lines = pre.lines[:]
     idx = 0
@@ -549,7 +717,7 @@ def parse_structured_50F(pre: PreprocessResult, message_id: str = "MSG") -> Cano
                 res.country_town = CountryTown(country=None, town=value, postal_code=None)
                 warnings.append("invalid_structured_line_3")
         elif tag == "4":
-            res.dob = value
+            res.dob = _parse_date_of_birth(value)
             has_4 = True
         elif tag == "5":
             res.pob = _parse_place_of_birth(value)
@@ -585,7 +753,7 @@ def parse_structured_50F(pre: PreprocessResult, message_id: str = "MSG") -> Cano
 
 
 def parse_structured_59F(pre: PreprocessResult, message_id: str = "MSG") -> CanonicalParty:
-    res = _empty("59F", "creditor", message_id)
+    res = _empty("59F", "creditor", message_id, raw=pre.normalized_text or pre.raw_input)
     warnings = res.meta.warnings
     lines = pre.lines[:]
     idx = 0

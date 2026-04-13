@@ -28,10 +28,14 @@ def test_parse_50f_with_dob_and_pob():
 3/BE/ANTWERPEN
 4/19720830
 5/BE/BRUSSELS
-"""
+    """
     p = preprocess(raw)
     result = parse_field(p)
-    assert result.dob == "19720830"
+    assert result.dob is not None
+    assert result.dob.raw == "19720830"
+    assert result.dob.year == "1972"
+    assert result.dob.month == "08"
+    assert result.dob.day == "30"
     assert result.pob is not None
     assert result.pob.country == "BE"
     assert result.pob.city == "BRUSSELS"

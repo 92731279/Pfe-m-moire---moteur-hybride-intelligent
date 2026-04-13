@@ -84,3 +84,35 @@ PARIS FRANCE
         w.startswith("libpostal:") or w.startswith("semantic_invalid_address_line")
         for w in result.meta.warnings
     )
+
+
+def test_validate_structured_composite_town_reduced_to_core():
+    raw = """:50F:/TN5908003000515000033732
+1/ETABL STABLE TEMENOS FRANCE
+2/24 RUE CLAUDE BERNARD
+3/TN/TUNIS BELVEDERE
+"""
+    p = preprocess(raw)
+    result = parse_field(p, message_id="MSG_E2_007")
+    result = validate_party_semantics(result)
+    assert result.country_town is not None
+    assert result.country_town.country == "TN"
+    assert result.country_town.town == "TUNIS BELVEDERE"
+    assert any(w.startswith("pass1_town_validated_via_core:TN:TUNIS BELVEDERE→TUNIS") for w in result.meta.warnings)
+    assert not any(w.startswith("pass1_town_not_found_worldwide") for w in result.meta.warnings)
+    assert not any(w == "pass2_geo_incoherent_cannot_validate_address" for w in result.meta.warnings)
+
+
+def test_validate_free_composite_town_reduced_to_core():
+    raw = """:50K:/FR76123456789012345
+JEAN DUPONT
+15 RUE DE LA PAIX
+PARIS CENTRE
+"""
+    p = preprocess(raw)
+    result = parse_field(p, message_id="MSG_E2_008")
+    result.country_town.country = "FR"
+    result = validate_party_semantics(result)
+    assert result.country_town is not None
+    assert result.country_town.town == "PARIS CENTRE"
+    assert not any(w.startswith("pass1_town_not_found_worldwide") for w in result.meta.warnings)

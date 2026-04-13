@@ -5,6 +5,7 @@ from src.e1_parser import parse_field
 from src.e2_validator import validate_party_semantics
 from src.e3_slm_fallback import needs_slm_fallback, apply_slm_fallback
 from src.pipeline_logger import PipelineLogger
+from src.rejection_policy import apply_rejection_policy
 
 
 def run_pipeline(
@@ -70,6 +71,13 @@ def run_pipeline(
             confidence=e2.meta.parse_confidence,
             warnings=e2.meta.warnings,
         )
+
+    e2 = apply_rejection_policy(e2)
+    logger.log(
+        "DECISION", "Décision métier",
+        rejected=e2.meta.rejected,
+        rejection_reasons=e2.meta.rejection_reasons,
+    )
 
     logger.log("OUTPUT", "Pipeline terminé")
     return e2, logger

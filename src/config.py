@@ -1,5 +1,6 @@
 """config.py — Configuration centrale du projet Moteur Hybride SWIFT"""
 
+import os
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -26,5 +27,8 @@ NOISE_PREFIXES = {
     "REF", "REF:", "REFERENCE", "BIC", "BIC:",
 }
 
-OLLAMA_BASE_URL = "http://172.31.96.1:11434"
-OLLAMA_MODEL = "phi3:mini"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://172.31.96.1:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3:mini")
+# Augmenter le timeout
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120"))
+OLLAMA_MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "1"))

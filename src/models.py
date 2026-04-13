@@ -40,6 +40,14 @@ class PlaceOfBirth(BaseModel):
     city: Optional[str] = None
 
 
+class DateOfBirth(BaseModel):
+    """Date de naissance avec composants"""
+    raw: Optional[str] = None
+    year: Optional[str] = None
+    month: Optional[str] = None
+    day: Optional[str] = None
+
+
 class PartyIdentifier(BaseModel):
     code: Optional[str] = None
     country: Optional[str] = None
@@ -53,6 +61,8 @@ class CanonicalMeta(BaseModel):
     warnings: List[str] = Field(default_factory=list)
     llm_signals: List[str] = Field(default_factory=list)
     fallback_used: bool = False
+    rejected: bool = False
+    rejection_reasons: List[str] = Field(default_factory=list)
 
 
 class CanonicalParty(BaseModel):
@@ -60,14 +70,15 @@ class CanonicalParty(BaseModel):
     field_type: str
     role: str
 
+    raw: Optional[str] = None
     account: Optional[str] = None
     party_id: Optional[PartyIdentifier] = None
-    name: List[str] = []
-    address_lines: List[str] = []
+    name: List[str] = Field(default_factory=list)
+    address_lines: List[str] = Field(default_factory=list)
 
     country_town: Optional[CountryTown] = None
 
-    dob: Optional[str] = None
+    dob: Optional[DateOfBirth] = None
     pob: Optional[PlaceOfBirth] = None
     org_id: Optional[PartyIdentifier] = None
     national_id: Optional[str] = None
