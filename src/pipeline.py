@@ -3,6 +3,7 @@
 from src.e0_preprocess import preprocess
 from src.e1_parser import parse_field
 from src.e2_validator import validate_party_semantics
+from src.e2_address_fragmentation import fragment_party_address
 from src.e3_slm_fallback import needs_slm_fallback, apply_slm_fallback
 from src.pipeline_logger import PipelineLogger
 from src.rejection_policy import apply_rejection_policy
@@ -51,6 +52,20 @@ def run_pipeline(
         warnings=e2.meta.warnings,
     )
 
+    # E2.5 — Fragmentation d'adresse (NOUVEAU)
+    logger.log("E2.5", "Début fragmentation adresse")
+    e2 = fragment_party_address(e2)
+    logger.log(
+        "E2.5", "Fragmentation terminée",
+        fragmented_count=len(getattr(e2, 'fragmented_addresses', [])),
+        confidence_avg=(
+            sum(addr.fragmentation_confidence 
+                for addr in getattr(e2, 'fragmented_addresses', [])) 
+            / len(getattr(e2, 'fragmented_addresses', []))
+            if getattr(e2, 'fragmented_addresses', []) else 0.0
+        ),
+    )
+
     # E3 — SLM Fallback
     use_slm = needs_slm_fallback(e2)
     logger.log("E3", "Décision fallback SLM", use_slm=use_slm)
@@ -66,6 +81,11 @@ def run_pipeline(
 
         logger.log("E2B", "Revalidation après SLM")
         e2 = validate_party_semantics(e2)
+        
+        # Re-fragmentation après SLM si nécessaire
+        logger.log("E2.5B", "Re-fragmentation après SLM")
+        e2 = fragment_party_address(e2)
+        
         logger.log(
             "E2B", "Revalidation terminée",
             confidence=e2.meta.parse_confidence,

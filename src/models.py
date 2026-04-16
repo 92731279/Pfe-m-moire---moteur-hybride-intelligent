@@ -1,7 +1,7 @@
 """models.py — Structures de données canoniques du moteur hybride SWIFT"""
 
 from typing import Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 # ============================================================
@@ -87,5 +87,32 @@ class CanonicalParty(BaseModel):
     is_org: Optional[bool] = None
 
     meta: CanonicalMeta
-
     address_validation: Optional[List[Dict]] = None
+    
+    # 🔹 NOUVEAU : Résultat de la fragmentation E2.5
+    fragmented_addresses: List["FragmentedAddress"] = Field(default_factory=list)
+
+
+# ============================================================
+# E2.5 — Fragmentation d'adresse (ISO 20022 mapping)
+# ============================================================
+
+class FragmentedAddress(BaseModel):
+    # ⚠️ AJOUTER CETTE LIGNE pour accepter les deux formats de noms
+    model_config = ConfigDict(populate_by_name=True)
+    
+    strt_nm: Optional[str] = Field(None, alias="StrtNm")
+    bldg_nb: Optional[str] = Field(None, alias="BldgNb")
+    bldg_nm: Optional[str] = Field(None, alias="BldgNm")
+    flr: Optional[str] = Field(None, alias="Flr")
+    room: Optional[str] = Field(None, alias="Room")
+    pst_cd: Optional[str] = Field(None, alias="PstCd")
+    twn_nm: Optional[str] = Field(None, alias="TwnNm")
+    ctry_sub_div: Optional[str] = Field(None, alias="CtrySubDvsn")
+    ctry: Optional[str] = Field(None, alias="Ctry")
+    
+    # Fallback XSD garanti si la fragmentation échoue
+    adr_line: List[str] = Field(default_factory=list)  
+    
+    fragmentation_confidence: float = 0.0
+    fallback_used: bool = False

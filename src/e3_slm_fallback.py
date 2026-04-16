@@ -286,6 +286,9 @@ class E3SLMFallback:
         
         return None
     
+    
+    
+    
     # =====================================================================
     # Prompt structuré (format clé:valeur, plus rapide que JSON)
     # =====================================================================
@@ -445,10 +448,18 @@ Maintenant extrais:
                 logger.debug(f"[E3] Nom mis à jour: {slm_name}")
         
         # 2. Adresse (ajouter si manquante)
-        sanitized_addresses = [
-            line for line in slm_result.get('address_lines', [])
-            if not _contains_account_text(line, party.account)
-        ]
+        # Dans _apply_slm_result, remplace la section adresse par :
+        sanitized_addresses = [line for line in slm_result.get('address_lines', []) 
+                            if not _contains_account_text(line, party.account)]
+        # ✅ GARDE : Ne remplace QUE si vide, sinon fusionne intelligemment
+        if sanitized_addresses and not party.address_lines:
+            party.address_lines = sanitized_addresses
+        elif sanitized_addresses and party.address_lines:
+            # Évite les doublons, garde la rue si le SLM a juste renvoyé la ville
+            for addr in sanitized_addresses:
+                if addr not in party.address_lines:
+                    party.address_lines.append(addr)
+            
         if sanitized_addresses and not party.address_lines:
             party.address_lines = sanitized_addresses
             updated = True
@@ -476,7 +487,7 @@ Maintenant extrais:
             
             # Prendre le SLM si la ville actuelle contient des mots d'adresse
             address_keywords = ['PO BOX', 'RUE', 'STREET', 'AVENUE', 'DEPT', 'DEPARTMENT']
-            has_address_words = any(kw in current_town for kw in address_keywords)
+            has_address_words = bool(current_town) and any(kw in current_town for kw in address_keywords)
             
             if not current_town or has_address_words or len(slm_town) < len(current_town):
                 if not party.country_town:

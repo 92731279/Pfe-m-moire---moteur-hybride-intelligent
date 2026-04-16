@@ -653,7 +653,37 @@ def render_address_validation(validations):
         html += "</div>"
     return html
 
-
+def render_fragmentation_results(frag_list):
+    """Rend le résultat de la fragmentation pour l'interface"""
+    if not frag_list:
+        return "<p style='color:#64748b;font-family:monospace'>Aucune fragmentation (liste vide)</p>"
+    
+    html = ""
+    for idx, frag in enumerate(frag_list):
+        # Style pour fallback ou succès
+        status_color = "var(--accent-green)" if not frag.fallback_used else "var(--accent-amber)"
+        status_text = "Standard" if not frag.fallback_used else "Fallback AdrLine"
+        
+        html += f"""
+        <div class='card' style="border-left: 4px solid {status_color}; margin-bottom: 15px;">
+            <div style="display:flex; justify-content:space-between; margin-bottom:10px;">
+                <span style="color:{status_color}; font-weight:bold; font-family:monospace;">
+                    🧩 Fragmentation #{idx + 1} — {status_text}
+                </span>
+                <span style="color:#94a3b8; font-size:0.7rem;">Confiance: {frag.fragmentation_confidence:.0%}</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 0.85rem; color: var(--text-primary);">
+                <div><small style="color:#64748b">StrtNm (Rue)</small><br><b>{frag.strt_nm or '—'}</b></div>
+                <div><small style="color:#64748b">BldgNb (Numéro)</small><br><b>{frag.bldg_nb or '—'}</b></div>
+                <div><small style="color:#64748b">Room (Unité)</small><br><b>{frag.room or '—'}</b></div>
+                <div><small style="color:#64748b">PstCd (Code Postal)</small><br><b>{frag.pst_cd or '—'}</b></div>
+                <div><small style="color:#64748b">TwnNm (Ville)</small><br><b>{frag.twn_nm or '—'}</b></div>
+                <div><small style="color:#64748b">Ctry (Pays)</small><br><b>{frag.ctry or '—'}</b></div>
+            </div>
+            {f'<div style="margin-top:10px; padding-top:5px; border-top:1px dashed #334155;"><small style="color:#64748b">AdrLine (Fallback):</small> {frag.adr_line}</div>' if frag.fallback_used else ''}
+        </div>
+        """
+    return html
 # ─────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────
@@ -886,11 +916,12 @@ if run:
         """, unsafe_allow_html=True)
 
         # ── Tabs ──
-        tab1, tab2, tab3, tab4 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "⬡  JSON Canonique",
             "⬡  Logs Pipeline",
             "⬡  Warnings & Signaux",
             "⬡  Validation Adresse",
+            "⬡  Fragmentation ISO"  # ✅ NOUVEAU
         ])
 
         with tab1:
@@ -934,6 +965,15 @@ if run:
                 unsafe_allow_html=True,
             )
 
+        with tab5:
+            st.markdown('<div class="section-label">Résultat de la Fragmentation (E2.5)</div>', unsafe_allow_html=True)
+            # On suppose que 'result' est ton objet CanonicalParty
+            if hasattr(result, 'fragmented_addresses') and result.fragmented_addresses:
+                st.markdown(render_fragmentation_results(result.fragmented_addresses), unsafe_allow_html=True)
+            else:
+                st.info("Aucune adresse à fragmenter pour ce message.")
+        
+   
     except Exception as e:
         import traceback
         progress_placeholder.empty()

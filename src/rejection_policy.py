@@ -1,38 +1,36 @@
-"""rejection_policy.py — Décision métier acceptation/rejet des messages parsés"""
-
+"""rejection_policy.py — Décision métier stricte : Acceptation ou Rejet/Quarantaine"""
 from typing import List
-
 from src.models import CanonicalParty
-
 
 def _append_once(items: List[str], value: str) -> None:
     if value not in items:
         items.append(value)
 
-
 def apply_rejection_policy(party: CanonicalParty) -> CanonicalParty:
     """
-    Marque le message comme rejeté si les éléments métier minimaux sont absents.
-    Règle actuelle pour champs libres 50K/59:
-    - nom obligatoire
-    - pays obligatoire
-    - au moins une localisation exploitable: ville OU adresse
+    Règle SR2026 stricte :
+    - <Ctry> obligatoire
+    - <TwnNm> obligatoire
+    Si la ville est absente ou ambiguë → REJET immédiat. Pas de fallback capitale.
     """
     reasons: List[str] = []
-
+    
     has_name = bool(party.name and any((x or "").strip() for x in party.name))
     has_country = bool(party.country_town and party.country_town.country)
-    has_town = bool(party.country_town and party.country_town.town)
-    has_address = bool(party.address_lines)
+    has_town = bool(
+        party.country_town 
+        and party.country_town.town 
+        and party.country_town.town not in {None, "AMBIGUOUS", "UNKNOWN", "NULL"}
+    )
 
     if not has_name:
         _append_once(reasons, "mandatory_missing:name")
     if not has_country:
         _append_once(reasons, "mandatory_missing:country")
-
-    if party.field_type in {"50K", "59", "50F", "59F"}:
-        if not (has_town or has_address):
-            _append_once(reasons, "mandatory_missing:town_or_address")
+        
+    # ⛔ STRICT : Si la ville n'est pas validée ou est ambiguë → REJET
+    if not has_town:
+        _append_once(reasons, "rejected_missing_or_ambiguous_town")
 
     party.meta.rejected = bool(reasons)
     party.meta.rejection_reasons = reasons

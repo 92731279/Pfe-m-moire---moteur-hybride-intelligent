@@ -1,4 +1,6 @@
-"""reference_data.py — Chargement des référentiels JSON"""
+"""reference_data.py — Chargement des référentiels JSON
+CORRECTION : ajout de CAPITALS dans les exports
+"""
 
 import json
 import re
@@ -63,6 +65,17 @@ SUPPLEMENTAL_COUNTRY_ALIASES = {
     "COREE DU NORD": "KP",
     "JAPON": "JP",
     "CHINE": "CN",
+    "BELGIQUE": "BE",
+    "LUXEMBOURG": "LU",
+    "HOLLANDE": "NL",
+    "MAROC": "MA",
+    "ALGERIE": "DZ",
+    "TUNISIE": "TN",
+    "LIBYE": "LY",
+    "EGYPTE": "EG",
+    "SENEGAL": "SN",
+    "COTE D IVOIRE": "CI",
+    "CAMEROUN": "CM",
 }
 
 
@@ -79,9 +92,19 @@ COUNTRY_NAME_TO_CODE = _build_country_lookup()
 COUNTRY_CODES = set(COUNTRY_NAME_TO_CODE.values())
 
 
-def resolve_country_code(value: str):
+def resolve_country_code(value: str) -> str:
+    """Résout un nom de pays ou code ISO vers le code ISO 2 lettres."""
+    if not value:
+        return None
+    v = value.strip().upper()
+    # Code ISO direct
+    if v in COUNTRY_CODES:
+        return v
+    # Alias normalisé
     return COUNTRY_NAME_TO_CODE.get(_normalize_country_alias(value))
 
+
+# ✅ CORRECTION : CAPITALS exporté pour le fallback capitale dans e1_parser
 CAPITALS = _load_json("capitals.json")
 ADDRESS_KEYWORDS = set(_load_json("address_keywords.json"))
 ORG_HINTS = set(_load_json("org_hints.json"))
