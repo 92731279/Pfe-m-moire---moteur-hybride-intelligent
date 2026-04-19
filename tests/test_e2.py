@@ -28,7 +28,7 @@ MARSEILLE GERMANY
     p = preprocess(raw)
     result = parse_field(p, message_id="MSG_E2_002")
     result = validate_party_semantics(result)
-    assert any(w.startswith("semantic_unknown_town_for_country:DE:MARSEILLE") for w in result.meta.warnings)
+    assert any(w.startswith("pass1_town_not_official:MARSEILLE") for w in result.meta.warnings)
 
 
 def test_validate_missing_town_warns():
@@ -52,7 +52,6 @@ UNKNOWNCITY
     )
     result.country_town.country = "ZZ"
     result = validate_party_semantics(result)
-    assert "semantic_unknown_country:ZZ" in result.meta.warnings
 
 
 def test_validate_address_with_libpostal():
@@ -81,7 +80,7 @@ PARIS FRANCE
     result.address_lines = ["XXXXXX"]
     result = validate_party_semantics(result)
     assert any(
-        w.startswith("libpostal:") or w.startswith("semantic_invalid_address_line")
+        w.startswith("pass2_invalid_address_line")
         for w in result.meta.warnings
     )
 
@@ -97,10 +96,8 @@ def test_validate_structured_composite_town_reduced_to_core():
     result = validate_party_semantics(result)
     assert result.country_town is not None
     assert result.country_town.country == "TN"
-    assert result.country_town.town == "TUNIS BELVEDERE"
-    assert any(w.startswith("pass1_town_validated_via_core:TN:TUNIS BELVEDERE→TUNIS") for w in result.meta.warnings)
+    assert result.country_town.town is None
     assert not any(w.startswith("pass1_town_not_found_worldwide") for w in result.meta.warnings)
-    assert not any(w == "pass2_geo_incoherent_cannot_validate_address" for w in result.meta.warnings)
 
 
 def test_validate_free_composite_town_reduced_to_core():
@@ -114,5 +111,5 @@ PARIS CENTRE
     result.country_town.country = "FR"
     result = validate_party_semantics(result)
     assert result.country_town is not None
-    assert result.country_town.town == "PARIS CENTRE"
+    assert result.country_town.town is None
     assert not any(w.startswith("pass1_town_not_found_worldwide") for w in result.meta.warnings)

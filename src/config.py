@@ -28,7 +28,7 @@ NOISE_PREFIXES = {
 }
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://172.31.96.1:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3:mini")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:0.5b")  # Changé de phi3:mini à qwen2.5:0.5b (plus léger)
 # Augmenter le timeout
 OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120"))
-OLLAMA_MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "1"))
+OLLAMA_MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "3"))  # Augmenté de 1 à 3 pour permettre les retries

@@ -1,4 +1,5 @@
 """e2_validator.py — Double validation sémantique: Pass1 geo + Pass2 adresse"""
+import re  # ✅ À ajouter en premier
 
 from typing import Dict, Set, List, Optional, Tuple
 from src.models import CanonicalParty
@@ -11,7 +12,7 @@ from src.toponym_normalizer import (
 # Import GeoNames avec gestion d'erreur
 try:
     from src.geonames.geonames_validator import validate_town_in_country
-    from src.geonames.geonames_db import find_place, find_alternate_place
+    from src.geonames.geonames_db import find_place, find_alternate_place, resolve_locality_hierarchy
     GEONAMES_AVAILABLE = True
     print("✅ GeoNames disponible pour validation")
 except ImportError:
@@ -42,55 +43,72 @@ CITY_TO_COUNTRY = _build_city_to_country_index()
 # ============================================================
 # PASS 1 — Validation géographique country/town
 # ============================================================
+
+
+
 def _validate_pass1_country_town(party: CanonicalParty) -> Tuple[str, str, bool, bool]:
     """
-    Validation stricte pays/ville (Conformité SR2026).
-    - Ne tronque AUCUN préfixe (Cité, Zone, Quartier...)
-    - Valide UNIQUEMENT sur preuve forte (GeoNames exact/alternate)
-    - Si localité/quartier ambigu sans ville parente explicite → town=None + WARNING
+    Validation stricte pays/ville.
+    Priorité: GeoNames. Si GeoNames valide la ville, on accepte et on résout la hiérarchie (ex: Enfidha → Sousse).
+    Sinon, si un contexte suburb est détecté, on bloque.
     """
     warnings = party.meta.warnings
     geo = party.country_town
     country = _norm(geo.country) if geo else ""
     town_raw = _norm(geo.town) if geo else ""
-    
-    # Liste des localités/quartiers connus comme ambigus (à enrichir via config ou DB)
-    # Ces zones ne sont PAS des villes administratives ISO 20022 valides sans contexte explicite
-    AMBIGUOUS_LOCALITIES = {
-        "TN": {"ERRIADH", "ENFIDHA", "MORNAG", "RAOUED", "EL_OMRANE", "CITE_EL_KHADRA", "SIDI_HASSINE"},
-        "FR": {"LA_DEFENSE", "SACLAY", "VILLEPINTE"},
-    }
-    
-    is_ambiguous = False
-    geo_coherent = False
-    town = town_raw  # Par défaut, on garde la valeur brute
 
-    # 1. Règle stricte : Détection de localité/quartier ambigu
-    if country in AMBIGUOUS_LOCALITIES and town_raw in AMBIGUOUS_LOCALITIES[country]:
-        _append_warning_once(warnings, f"ambiguous_suburb_detected:{town_raw}")
-        return country, None, False, True  # ✅ town=None force l'absence de ville administrative
+    # 1. 🔍 Détection du contexte "suburb/quartier" dans les lignes d'adresse brutes
+    SUBURB_KEYWORDS = {"CITE", "CITÉ", "ZONE", "QUARTIER", "SECTEUR", "IMMEUBLE", "IMM", "LOTISSEMENT"}
+    has_suburb_context = any(
+        any(kw in line.upper() for kw in SUBURB_KEYWORDS)
+        for line in (party.address_lines or [])
+    )
+    is_town_literally_a_suburb = any(kw in town_raw.upper() for kw in SUBURB_KEYWORDS)
 
-    # 2. Résolution GeoNames (uniquement si pas ambigu)
+    # 2. ✅ Validation GeoNames PRIORITAIRE (si la ville existe, on la garde / la promeut)
     if GEONAMES_AVAILABLE and country and town_raw:
         is_valid, canonical, matched_via = validate_town_in_country(country, town_raw)
-        
-        # Accepte uniquement match exact ou nom alternatif officiel
-        if is_valid and matched_via in {"exact", "alternate"}:
-            town = canonical
-            geo_coherent = True
-            _append_warning_once(warnings, f"pass1_town_confirmed_geonames:{matched_via}")
+        if is_valid and matched_via in {"exact", "alternate"} and not is_town_literally_a_suburb:
+            warnings.append(f"pass1_town_confirmed_geonames:{matched_via}")
+            if has_suburb_context:
+                warnings.append("pass1_town_extracted_from_suburb_and_confirmed")
+            
+            # ✅ NEW: Résoudre la hiérarchie géographique (Enfidha → Sousse)
+            parent_town = resolve_locality_hierarchy(country, town_raw)
+            if parent_town and parent_town.upper() != canonical.upper():
+                # C'est une localité avec un parent administratif
+                warnings.append(f"pass1_locality_promoted_to_parent:{canonical}→{parent_town}")
+                return country, parent_town.upper(), True, False
+            
+            return country, canonical.upper(), True, False
         else:
-            # GeoNames ne trouve pas de ville officielle → ambiguë ou inconnue
-            _append_warning_once(warnings, f"pass1_town_not_official_city:{town_raw}")
-            is_ambiguous = True
-            town = None  # ⛔ On ne devine pas. On vide le champ.
+            warnings.append(f"pass1_town_not_official:{town_raw}")
+            if is_town_literally_a_suburb:
+                warnings.append("pass1_town_is_suburb_keyword_rejected")
+                warnings.append("requires_manual_verification:suburb_cannot_be_promoted_to_city")
+                party.meta.parse_confidence = min(party.meta.parse_confidence, 0.40)
+                return country, None, False, True
+            if has_suburb_context:
+                warnings.append("pass1_suburb_context_detected_and_town_invalid")
+                warnings.append("requires_manual_verification:suburb_cannot_be_promoted_to_city")
+                party.meta.parse_confidence = min(party.meta.parse_confidence, 0.40)
+                return country, None, False, True
+            warnings.append("requires_manual_verification:town_unverified")
+            return country, None, False, True
+
+    # 3. 🚫 BLOCAGE STRICT si contexte suburb détecté et pas de ville
+    if has_suburb_context:
+        warnings.append("pass1_suburb_context_detected")
+        warnings.append("requires_manual_verification:suburb_cannot_be_promoted_to_city")
+        party.meta.parse_confidence = min(party.meta.parse_confidence, 0.40)
+        return country, None, False, True  # town=None, is_ambiguous=True → Quarantaine
+
     elif not country:
-        _append_warning_once(warnings, "pass1_country_missing")
-        party.meta.parse_confidence = min(party.meta.parse_confidence, 0.60)
+        warnings.append("pass1_country_missing")
+        return country, None, False, True
 
-    return country, town, geo_coherent, is_ambiguous
-
-
+    # Fallback safe : on garde la valeur brute
+    return country, town_raw, True, False
 # ============================================================
 # PASS 2 — Validation des lignes d'adresse
 # ============================================================

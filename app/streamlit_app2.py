@@ -746,7 +746,7 @@ with col_input:
 with col_config:
     st.markdown('<div class="section-label">Configuration</div>', unsafe_allow_html=True)
     message_id = st.text_input("Message ID", value="MSG_UI_001")
-    slm_model = st.text_input("Modèle SLM", value="phi3:mini")
+    slm_model = st.text_input("Modèle SLM", value="qwen2.5:0.5b")
 
     st.markdown("<br>", unsafe_allow_html=True)
     run = st.button("⚡  Analyser le message", use_container_width=True)

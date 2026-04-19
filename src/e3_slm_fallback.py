@@ -18,6 +18,55 @@ from src.reference_data import resolve_country_code
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# CIRCUIT BREAKER SIMPLE - Éviter les cascades d'erreurs Ollama
+# =============================================================================
+
+class OllamaCircuitBreaker:
+    """Circuit breaker simple pour protéger contre les surcharges Ollama."""
+    
+    def __init__(self, failure_threshold: int = 3, recovery_timeout: int = 30):
+        self.failure_threshold = failure_threshold  # Nombre d'erreurs avant de ouvrir
+        self.recovery_timeout = recovery_timeout    # Secondes avant retry après fermeture
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.is_open = False
+    
+    def record_failure(self):
+        """Enregistre une failure."""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.failure_count >= self.failure_threshold:
+            self.is_open = True
+            logger.warning(
+                f"[E3] Circuit breaker OUVERT après {self.failure_count} erreurs. "
+                f"Retentatives bloquées pour {self.recovery_timeout}s"
+            )
+    
+    def record_success(self):
+        """Réinitialise après succès."""
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.is_open = False
+    
+    def can_attempt(self) -> bool:
+        """Vérifie si une tentative est possible."""
+        if not self.is_open:
+            return True
+        
+        # Vérifier si le timeout de récupération est passé
+        if self.last_failure_time and (time.time() - self.last_failure_time) > self.recovery_timeout:
+            logger.info("[E3] Circuit breaker tentative de FERMETURE")
+            self.is_open = False
+            self.failure_count = 0
+            return True
+        
+        return False
+
+
+_ollama_circuit_breaker = OllamaCircuitBreaker(failure_threshold=2, recovery_timeout=20)
+
+
 def _meta_get(meta: Any, field: str, default: Any = None) -> Any:
     """Compat helper for CanonicalMeta instances and legacy dict metadata."""
     if meta is None:
@@ -141,7 +190,7 @@ class E3SLMFallback:
     """Fallback SLM optimisé pour corriger les cas ambigus"""
     
     def __init__(self, ollama_url: str = OLLAMA_BASE_URL, 
-                 model: str = "phi3:mini"):
+                 model: str = "qwen2.5:0.5b"):
         self.ollama_url = ollama_url
         self.model = model
         self.timeout = OLLAMA_TIMEOUT_SECONDS
@@ -232,8 +281,13 @@ class E3SLMFallback:
     
     def _call_slm_optimized(self, party: CanonicalParty) -> Optional[Dict[str, Any]]:
         """
-        Appelle Ollama avec timeout court et retries.
+        Appelle Ollama avec timeout court, retries, backoff et circuit breaker.
         """
+        # Vérifier le circuit breaker
+        if not _ollama_circuit_breaker.can_attempt():
+            logger.warning("[E3] Circuit breaker OUVERT - SLM désactivé temporairement")
+            return None
+        
         prompt = self._build_structured_prompt(party)
         
         payload = {
@@ -263,27 +317,43 @@ class E3SLMFallback:
                 if response.status_code == 200:
                     result_text = response.json().get("response", "").strip()
                     logger.info(f"[E3] SLM réponse en {elapsed:.1f}s")
+                    _ollama_circuit_breaker.record_success()  # Réinitialiser le circuit breaker
                     return self._parse_slm_response(result_text)
                 else:
-                    logger.warning(f"[E3] HTTP {response.status_code}")
+                    logger.warning(f"[E3] HTTP {response.status_code} (tentative {attempt + 1}/{self.max_retries})")
+                    _ollama_circuit_breaker.record_failure()
+                    
+                    # Réduire le prompt pour la retry en cas d'erreur
+                    if attempt < self.max_retries - 1:
+                        payload["options"]["num_predict"] = max(60, payload["options"]["num_predict"] - 30)
+                        wait_time = min(5, (attempt + 1) * 2)  # Backoff exponentiel: 2s, 4s, 6s...
+                        logger.debug(f"[E3] Attente {wait_time}s avant retry...")
+                        time.sleep(wait_time)
                     
             except requests.Timeout:
                 logger.warning(
-                    f"[E3] Timeout Ollama sur {self.ollama_url} "
-                    f"(tentative {attempt + 1}/{self.max_retries}, model={self.model}, timeout={self.timeout}s)"
+                    f"[E3] Timeout Ollama (tentative {attempt + 1}/{self.max_retries}, "
+                    f"model={self.model}, timeout={self.timeout}s)"
                 )
-                if attempt == 0:
-                    # Réduire encore pour la retry
-                    payload["options"]["num_predict"] = 60
+                _ollama_circuit_breaker.record_failure()
+                
+                if attempt < self.max_retries - 1:
+                    payload["options"]["num_predict"] = max(60, payload["options"]["num_predict"] - 30)
+                    wait_time = min(5, (attempt + 1) * 2)
+                    logger.debug(f"[E3] Attente {wait_time}s avant retry...")
+                    time.sleep(wait_time)
                     
             except requests.ConnectionError as e:
                 logger.error(f"[E3] Connection error: {e}")
+                _ollama_circuit_breaker.record_failure()
                 break
                 
             except Exception as e:
-                logger.error(f"[E3] Erreur: {e}")
+                logger.error(f"[E3] Erreur inattendue: {type(e).__name__}: {e}")
+                _ollama_circuit_breaker.record_failure()
                 break
         
+        logger.warning("[E3] SLM n'a pas pu générer de réponse après tous les retries")
         return None
     
     
@@ -296,6 +366,7 @@ class E3SLMFallback:
     def _build_structured_prompt(self, party: CanonicalParty) -> str:
         """
         Construit un prompt optimisé pour des réponses rapides et précises.
+        VERSION 2: EXEMPLES D'ABORD pour éviter confusion SLM petit modèle.
         """
         raw = party.raw or ""
         field_type = party.field_type
@@ -303,59 +374,47 @@ class E3SLMFallback:
         
         issues = ", ".join([str(w) for w in current_warnings[:3]]) if current_warnings else "aucun"
         
-        prompt = f"""Extraire les informations de ce message bancaire SWIFT {field_type}.
+        # Format strict: EXEMPLES D'ABORD, puis vraies données à la fin
+        prompt = f"""TÂCHE: Extraire les informations d'un message SWIFT {field_type}.
 
-MESSAGE:
-{raw}
+RÈGLES STRICTES:
+1. name = UNIQUEMENT nom personne ou entreprise (pas adresse)
+2. address = rue/numéro/PO BOX/bâtiment (PAS ville, PAS pays)
+3. town = ville SEULE (PAS adresse, PAS pays, PAS postal)
+4. country = code ISO 2 lettres uniquement (FR, DE, CA, TN, AE, US, etc)
+5. postal = code postal ou - si absent
 
-PROBLÈMES DÉTECTÉS: {issues}
-
-RÈGLES:
-1. name = nom de la personne OU nom de l'entreprise (UNIQUEMENT le nom)
-2. address = rue, numéro, PO BOX, département, bâtiment (PAS la ville, PAS le pays)
-3. town = ville UNIQUEMENT (pas d'adresse, pas de pays, pas de code postal)
-4. country = code ISO à 2 lettres (FR, DE, CA, AE, TR, TN, MA, US, GB...)
-5. postal = code postal si présent (sinon -)
-
-RÉPONDRE UNIQUEMENT AU FORMAT SUIVANT (5 lignes exactement):
+FORMAT RÉPONSE (5 lignes):
 name: <valeur>
 address: <valeur ou ->
 town: <valeur>
-country: <code ISO 2 lettres>
+country: <XX>
 postal: <valeur ou ->
 
-EXEMPLES:
+EXEMPLES (copier ce format):
 
-Input: "JANE DOE RUE DE LA PAIX\nPARIS\nFRANCE"
+Input: "JANE DOE\nRUE DE LA PAIX\nPARIS FRANCE"
+Output:
 name: JANE DOE
 address: RUE DE LA PAIX
 town: PARIS
 country: FR
 postal: -
 
-Input: "MOHSEN ISMAIL\nPO BOX 25026 EDUCATION DEPT ABU DHABI\nUNITED ARAB EMIRATES"
+Input: "MOHSEN ISMAIL\nPO BOX 25026 ABU DHABI\nUAE"
+Output:
 name: MOHSEN ISMAIL
-address: PO BOX 25026 EDUCATION DEPT
+address: PO BOX 25026
 town: ABU DHABI
 country: AE
 postal: -
 
-Input: "BEN TALEB CHOKRI\n8846 RUE VALADE\nQUEBEC QC G1G6L5 CA"
-name: BEN TALEB CHOKRI
-address: 8846 RUE VALADE
-town: QUEBEC
-country: CA
-postal: G1G6L5
+---
 
-Input: "LESAFFRE TURQUIE MAYACILIK URETI\nTURQUIE"
-name: LESAFFRE TURQUIE MAYACILIK URETI
-address: -
-town: -
-country: TR
-postal: -
+À TRAITER (même format, répondre UNIQUEMENT le Output):
 
-Maintenant extrais:
-"""
+Input: "{raw}"
+Output:"""
         return prompt
     
     # =====================================================================
@@ -635,6 +694,6 @@ def needs_slm_fallback(party: CanonicalParty) -> bool:
     return E3SLMFallback()._needs_fallback(party)
 
 
-def apply_slm_fallback(party: CanonicalParty, model: str = "phi3:mini") -> CanonicalParty:
+def apply_slm_fallback(party: CanonicalParty, model: str = "qwen2.5:0.5b") -> CanonicalParty:
     """Compatibility wrapper expected by pipeline.py."""
     return E3SLMFallback(model=model).apply_fallback(party)

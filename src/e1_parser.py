@@ -1,8 +1,8 @@
-"""e1_parser.py — Étape E1: Parsing structuré et libre des champs SWIFT
-CORRECTIONS GLOBALES :
-- Intégration GeoNames pour extraire les villes masquées dans les adresses (ex: ZONE INDUSTRIELLE ENFIDHA)
-- Nettoyage des espaces parasites dans SHORT_COUNTRY_TO_ISO
-- Fallback robuste sur GeoNames avant la capitale
+"""e1_parser.py — Étape E1 : Parsing structuré et libre des champs SWIFT
+CORRECTIONS CRITIQUES :
+- Ajout regex pour format "PAYS VILLE POSTAL" (ex: TN ELHAOUARIA 8045)
+- Suppression des espaces parasites dans SHORT_COUNTRY_TO_ISO et ARTIFACTS
+- Nettoyage robuste des villes
 """
 import re
 from typing import List, Optional, Tuple
@@ -15,15 +15,8 @@ from src.reference_data import (
     PARTY_ID_PREFIXES, CITIES_BY_COUNTRY, CAPITALS, resolve_country_code,
 )
 from src.ambiguity_resolver import resolve_city_country_ambiguity
-from src.toponym_normalizer import town_known_for_country
 
-# ✅ Import GeoNames Validator avec gestion d'erreur si DB non dispo
-try:
-    from src.geonames.geonames_validator import validate_town_in_country
-    GEONAMES_AVAILABLE = True
-except ImportError:
-    GEONAMES_AVAILABLE = False
-
+# ✅ FIX: Suppression des espaces parasites dans les clés/valeurs
 SHORT_COUNTRY_TO_ISO = {
     "A": "AT", "B": "BE", "D": "DE", "E": "ES", "F": "FR",
     "G": "GR", "I": "IT", "L": "LU", "N": "NO", "P": "PT",
@@ -31,8 +24,9 @@ SHORT_COUNTRY_TO_ISO = {
 }
 
 def _norm(value):
+    """Normalise: majuscules, espaces uniques, strip."""
     if not value: return ""
-    return re.sub(r"\s+", " ", value.strip())
+    return " ".join(value.strip().upper().split())
 
 def _empty(field_type, role, message_id, raw=None):
     return CanonicalParty(
@@ -61,29 +55,70 @@ def _is_address(line):
     if _contains_address_keyword(up): return True
     if re.search(r"\d", up): return True
     return False
+
+def _extract_town_from_zone_line(line: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Détecte et extrait la ville d'une ligne comme "ZONE INDUSTRIELLE ENFIDHA".
+    Retourne (address_part, town_candidate).
+    
+    Exemples:
+    - "ZONE INDUSTRIELLE ENFIDHA" → ("ZONE INDUSTRIELLE", "ENFIDHA")
+    - "PARC COMMERCIAL SOUSSE" → ("PARC COMMERCIAL", "SOUSSE")
+    - "RUE DE LA PAIX" → (None, None)  # Pas de pattern zone
+    """
+    up = _norm(line).upper()
+    
+    # Patterns: ZONE INDUSTRIELLE, ZONE COMMERCIALE, PARC, ACTIVITÉ, etc.
+    zone_patterns = [
+        r"^(ZONE\s+INDUSTRIELLE)\s+(.+)$",
+        r"^(ZONE\s+COMMERCIALE)\s+(.+)$",
+        r"^(ZONE\s+D'ACTIVITÉ)\s+(.+)$",
+        r"^(PARC\s+INDUSTRIEL)\s+(.+)$",
+        r"^(PARC\s+COMMERCIAL)\s+(.+)$",
+    ]
+    
+    for pattern in zone_patterns:
+        match = re.match(pattern, up)
+        if match:
+            zone_type = match.group(1)
+            remainder = match.group(2).strip()
+            
+            # Extrait le dernier mot potentiel comme ville
+            words = remainder.split()
+            if words:
+                candidate = words[-1]
+                # Exclusions de mots génériques
+                if candidate not in {"INDUSTRIELLE", "COMMERCIAL", "D'ACTIVITÉ", "TUNISIE", "TN"}:
+                    town_candidate = _clean_town_value(candidate)
+                    if town_candidate and len(town_candidate) >= 3:
+                        # Reconstruit l'adresse sans le town candidate
+                        if len(words) > 1:
+                            address_part = " ".join(words[:-1])
+                            return (f"{zone_type} {address_part}", town_candidate)
+                        else:
+                            return (zone_type, town_candidate)
+    
+    return (None, None)
+
 def _looks_like_real_address_fragment(value):
     up = _norm(value).upper()
     return bool(up) and _contains_address_keyword(up)
 
 def _clean_town_value(town):
-    """Nettoie les suffixes parasites SANS couper les noms de villes légitimes."""
+    """Nettoie les suffixes parasites. ✅ FIX: ARTIFACTS sans espaces."""
     if not town: return town
     cleaned = _norm(town)
+    
+    # ✅ FIX: Suppression des espaces dans les strings
     ARTIFACTS = {"->", "→", "??", "N/A", "NA", "NONE", "NULL", "-", "..."}
     if cleaned.upper() in ARTIFACTS: return None
     if re.fullmatch(r"\d{3,8}", cleaned): return None
     
-    # ✅ CORRECTION CRITIQUE : Vérifier que les 2 derniers caractères sont bien un code pays ISO
-    m = re.match(r'^(.+?)\s*[-/\s]\s*([A-Z]{2})\s*$', cleaned, flags=re.IGNORECASE)
-    if m and m.group(2).upper() in COUNTRY_CODES:
-        cleaned = m.group(1).strip()
-    else:
-        # Fallback simple : espace + code pays
-        m2 = re.match(r'^(.+?)\s+([A-Z]{2})\s*$', cleaned)
-        if m2 and m2.group(2).upper() in COUNTRY_CODES:
-            cleaned = m2.group(1).strip()
-            
-    # Supprimer nom de pays connu en fin (ex: "TUNIS TUNISIE" -> "TUNIS")
+    # Supprime /FR ou -FR en fin
+    cleaned = re.sub(r'\s*/\s*[A-Z]{2}\s*$', '', cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r'[-–]\s*[A-Z]{2}\s*$', '', cleaned, flags=re.IGNORECASE).strip()
+    
+    # Supprime code pays ISO en fin (ex: "TUNIS TUNISIE")
     up = cleaned.upper()
     for cname in sorted(COUNTRY_NAME_TO_CODE.keys(), key=len, reverse=True):
         suffix = " " + cname
@@ -142,11 +177,25 @@ def _parse_party_identifier(raw):
     return PartyIdentifier(code=code, country=country, issuer=issuer, identifier=identifier)
 
 def _split_embedded_country_prefix(line):
+    """
+    Détecte un code pays collé au début d'une ligne (ex: "TNELHAOUARIA" → "TN", "ELHAOUARIA").
+    CORRECTIONS :
+    - Ignore si le "reste" ressemble à un nom propre (minuscules, espaces)
+    - Ignore si la ligne commence par "/" (compte IBAN)
+    - Vérifie que le préfixe n'est pas le début d'un mot plus long
+    """
     raw = _norm(line)
     up = raw.upper()
-    if len(up) < 4: return None, raw
+    
+    # Garde 1: Ligne trop courte ou commence par "/" (compte IBAN)
+    if len(up) < 4 or raw.startswith("/"):
+        return None, raw
+    
     prefix = up[:2]
-    if prefix not in COUNTRY_CODES: return None, raw
+    if prefix not in COUNTRY_CODES:
+        return None, raw
+    
+    # Garde 2: Liste des préfixes protégés (villes, mots courants)
     PROTECTED = (
         "PAR", "PAL", "PAD", "PAN", "PAM", "MAD", "MAR", "MAN", "MAL", "MAP",
         "BER", "BEL", "BEN", "BRU", "BEI", "IST", "IND", "IRE", "NOR",
@@ -164,9 +213,35 @@ def _split_embedded_country_prefix(line):
         "TAI", "TAS", "TAL", "TEH", "THE", "TIR", "TUN", "ULA", "VAL", "VAN",
         "VIE", "VIL", "WAR", "WAS", "YAO", "YER", "ZAG",
     )
-    if up.startswith(PROTECTED) or up in KNOWN_CITIES: return None, raw
+    
+    # Garde 3: Si la ligne commence par un mot protégé → pas un pays collé
+    if up.startswith(PROTECTED) or up in KNOWN_CITIES:
+        return None, raw
+    
+    # ✅ NOUVELLE GARDE CRITIQUE : Le "reste" ne doit pas ressembler à un nom propre
     rest = raw[2:].strip(" ,-/")
-    if not rest or len(rest) < 2: return None, raw
+    if not rest or len(rest) < 2:
+        return None, raw
+    
+    # Si le reste contient des minuscules → c'est probablement un nom (ex: "hilips" dans "PHILIPS")
+    if any(c.islower() for c in rest):
+        return None, raw
+    
+    # Si le reste contient un espace ET ressemble à un nom complet (ex: "ILIPS MARK")
+    if " " in rest and len(rest.split()) >= 2:
+        # Vérifier si le premier mot du reste n'est pas une ville connue
+        first_word = rest.split()[0].upper()
+        if first_word not in KNOWN_CITIES and first_word not in COUNTRY_CODES:
+            return None, raw
+    
+    # ✅ Dernière vérification: le préfixe doit être suivi d'un séparateur ou d'une majuscule
+    # Ex: "TN ELHAOUARIA" (OK) vs "TNELHAOUARIA" (douteux mais accepté si le reste est plausible)
+    if len(raw) > 2 and raw[2] not in " -/," and not raw[2].isupper():
+        # Si le 3ème caractère n'est pas un séparateur ni une majuscule, c'est suspect
+        # Mais on accepte si le reste est court et en majuscules (ex: "TN8045")
+        if len(rest) > 10 or any(c.islower() for c in rest):
+            return None, raw
+    
     return prefix, rest
 
 def _split_inline_name_address(line):
@@ -232,8 +307,17 @@ def _parse_country_encoded_line(line):
     return CountryTown(country=cc, town=right, postal_code=None)
 
 def _extract_country_postal_town_fragment(line):
-    """Détecte fragments géo dans une ligne."""
+    """
+    Détecte fragments géo dans une ligne.
+    Formats supportés:
+    - FR/75002 PARIS | FR 75002 PARIS
+    - B -6600 BASTOGNE
+    - ✅ NOUVEAU: TN ELHAOUARIA 8045 (PAYS VILLE POSTAL)
+    - 38100 GRENOBLE
+    """
     raw = _norm(line)
+    
+    # 1. Standard: CC/PC TOWN ou CC PC TOWN
     for pat in [
         r"\b([A-Z]{2})/(\d{3,10})\s+([A-Z][A-Z0-9()' .\-]+)$",
         r"\b([A-Z]{2})\s+(\d{3,10})\s+([A-Z][A-Z0-9()' .\-]+)$",
@@ -245,6 +329,7 @@ def _extract_country_postal_town_fragment(line):
                 town = _clean_town_value(_norm(m.group(3)))
                 if town: return m.start(), m.end(), CountryTown(country=cc, town=town, postal_code=m.group(2))
 
+    # 2. Format court: B -6600 BASTOGNE
     m = re.search(r"^([A-Za-z]{1,2})\s*[-–]\s*(\d{3,10})\s+([A-Z][A-Z0-9()' .\-]+)$", raw, flags=re.IGNORECASE)
     if m:
         cc = m.group(1).upper().strip()
@@ -253,27 +338,51 @@ def _extract_country_postal_town_fragment(line):
             town = _clean_town_value(_norm(m.group(3)))
             if town: return m.start(), m.end(), CountryTown(country=cc, town=town, postal_code=m.group(2))
 
+    # 3. ✅ NOUVEAU: Format PAYS VILLE POSTAL (ex: TN ELHAOUARIA 8045)
+    m = re.search(r"\b([A-Z]{2})\s+([A-Z][A-Z0-9()' .\-]+)\s+(\d{3,10})$", raw, flags=re.IGNORECASE)
+    if m:
+        cc = m.group(1).upper()
+        if cc in COUNTRY_CODES:
+            town = _clean_town_value(_norm(m.group(2))) # G2 est la ville
+            pc = m.group(3)                            # G3 est le postal
+            if town: return m.start(), m.end(), CountryTown(country=cc, town=town, postal_code=pc)
+
+    # 4. Format VILLE PROVINCE POSTAL PAYS (ex: QUEBEC QC G1G6L5 CA ou QUEBEC QC G1G 6L5 CA)
+    # Match: (Ville et mots) (2 lettres province/état optionnel) (Code postal CA ou standard) (CA/US)
+    m = re.search(r"^([A-Z][A-Z0-9()' .\-]+?)\s+(?:[A-Z]{2}\s+)?([A-Z0-9][A-Z0-9\- ]{2,8})\s+(CA|US)$", raw, flags=re.IGNORECASE)
+    if m:
+        cc = m.group(3).upper()
+        if cc in COUNTRY_CODES:
+            town = _clean_town_value(_norm(m.group(1)))
+            pc = _norm(m.group(2)).replace(" ", "")
+            if town: return m.start(), m.end(), CountryTown(country=cc, town=town, postal_code=pc)
+
+    # 5. Postal seul: 38100 GRENOBLE
     m = re.match(r"^(\d{4,6})\s+([A-Z][A-Z0-9()' .\-]+)$", raw, flags=re.IGNORECASE)
     if m:
         town = _clean_town_value(_norm(m.group(2)))
-        if town: return 0, len(raw), CountryTown(country=None, town=town, postal_code=m.group(1))
+        # Eviter que ça matche de faux numéros de rue (ex: 8846 RUE VALADE)
+        if town and not _contains_address_keyword(town): return 0, len(raw), CountryTown(country=None, town=town, postal_code=m.group(1))
 
     return None
-
 def _apply_iban_and_capital_fallback(geo, iban_country, warnings):
-    """IBAN prime pour pays + fallback capitale si ville manque."""
-    if geo.town: geo.town = _clean_town_value(geo.town)
+    """IBAN prime pour pays. FALLBACK CAPITALE SUPPRIMÉ pour conformité stricte SR2026."""
+    if geo.town:
+        geo.town = _clean_town_value(geo.town)
+        
     if iban_country:
         if not geo.country:
             geo.country = iban_country
             warnings.append("country_from_iban")
         elif geo.country != iban_country:
             warnings.append(f"country_conflict_iban_hint_only:{iban_country}!=explicit:{geo.country}")
-    if geo.country and not geo.town:
-        capital = CAPITALS.get(geo.country)
-        if capital:
-            geo.town = capital
-            warnings.append(f"town_inferred_from_capital:{geo.country}→{capital}")
+            
+    # ⛔ SUPPRESSION DU FALLBACK CAPITALE : Si town est null, il reste null pour quarantaine
+    # if geo.country and not geo.town:
+    #     capital = CAPITALS.get(geo.country)
+    #     if capital:
+    #         geo.town = capital
+    #         warnings.append(f"town_inferred_from_capital:{geo.country}→{capital}")
     return geo
 
 def _extract_geo_from_free_lines(lines, warnings):
@@ -281,19 +390,23 @@ def _extract_geo_from_free_lines(lines, warnings):
     last = _norm(lines[-1])
     up = last.upper()
 
+    # 1. Format JO/JORDANIE
     encoded = _parse_country_encoded_line(last)
     if encoded:
         if encoded.town is None: return encoded, 1
         if _is_known_country_name(encoded.town):
             return CountryTown(country=encoded.country, town=None, postal_code=None), 1
 
+    # 2. Ville connue seule
     if _is_known_city(last): return CountryTown(country=None, town=last, postal_code=None), 1
 
+    # 3. Fragment pays/postal/ville
     frag = _extract_country_postal_town_fragment(last)
     if frag:
         _, _, ct = frag
         if ct.country or ct.postal_code: return ct, 1
 
+    # 4. Format pays court avec tiret: B -6600 BASTOGNE
     m_short = re.match(r"^([A-Za-z]{1,2})\s*[-–]?\s*(\d{4,6})\s+(.+)$", last, flags=re.IGNORECASE)
     if m_short:
         cc = m_short.group(1).upper().strip()
@@ -304,6 +417,7 @@ def _extract_geo_from_free_lines(lines, warnings):
                 warnings.append(f"short_country_code_normalized:{m_short.group(1).upper()}→{cc}")
                 return CountryTown(country=cc, town=town, postal_code=m_short.group(2)), 1
 
+    # 5. Pays connu (nom complet ou code)
     code = resolve_country_code(last)
     if code:
         if len(lines) >= 2:
@@ -314,44 +428,31 @@ def _extract_geo_from_free_lines(lines, warnings):
                 if ct_prev.country == code or ct_prev.country is None: ct_prev.country = code
                 ct_prev.town = _clean_town_value(ct_prev.town)
                 return ct_prev, 2
+            
+            # ✅ CORRECTION CRITIQUE : Gestion des Zones Industrielles / Commerciales safely
+            _, town_from_zone = _extract_town_from_zone_line(prev)
+            if town_from_zone:
+                return CountryTown(country=code, town=town_from_zone, postal_code=None), 2
+
             m = re.match(r"^(\d{4,6})\s+(.+)$", prev)
             if m:
                 town = _clean_town_value(m.group(2).strip())
-                return CountryTown(country=code, town=town, postal_code=m.group(1).strip()), 2
+                if town and not _contains_address_keyword(town):
+                    return CountryTown(country=code, town=town, postal_code=m.group(1).strip()), 2
             
-            # ==============================================================================
-            # ✅ CORRECTION CRITIQUE : Gestion des villes masquées dans l'adresse via GeoNames
-            # Cas : "ZONE INDUSTRIELLE ENFIDHA" -> On vérifie si "ENFIDHA" est une ville TN
-            # ==============================================================================
-            if _is_address(prev):
-                words = prev.split()
-                if words:
-                    candidate = words[-1] # Prend le dernier mot (ex: ENFIDHA)
-                    
-                    # 1. Vérification rapide via GeoNames (Source de vérité mondiale)
-                    if GEONAMES_AVAILABLE:
-                        is_valid, canonical, _ = validate_town_in_country(code, candidate)
-                        if is_valid:
-                            warnings.append(f"town_extracted_via_geonames_from_address:{candidate}→{canonical}")
-                            return CountryTown(country=code, town=canonical, postal_code=None), 1
-                    
-                    # 2. Fallback JSON local si GeoNames indisponible ou échec
-                    if town_known_for_country(code, candidate):
-                        warnings.append(f"town_found_in_json_from_address:{candidate}")
-                        return CountryTown(country=code, town=candidate, postal_code=None), 1
-            # ==============================================================================
-
             if prev and (not _is_address(prev)):
                 return CountryTown(country=code, town=_clean_town_value(prev), postal_code=None), 2
         
         return CountryTown(country=code, town=None, postal_code=None), 1
 
+    # 6. Fin de ligne = "VILLE PAYS"
     for name, code in COUNTRY_NAME_TO_CODE.items():
         suffix = " " + name
         if up.endswith(suffix):
             town = _clean_town_value(last[:-len(suffix)].strip())
             return CountryTown(country=code, town=town or None, postal_code=None), 1 
 
+    # 7. Pays collé (TN...)
     embedded_country, cleaned_town = _split_embedded_country_prefix(last)
     if embedded_country and cleaned_town:
         cleaned_cc = resolve_country_code(cleaned_town)
@@ -361,19 +462,25 @@ def _extract_geo_from_free_lines(lines, warnings):
         town = _clean_town_value(cleaned_town)
         return CountryTown(country=embedded_country, town=town, postal_code=None), 1
 
+    # 8. Postal seul
     m = re.match(r"^(\d{4,6})\s+(.+)$", last)
     if m:
         town = _clean_town_value(m.group(2).strip())
-        return CountryTown(country=None, town=town, postal_code=m.group(1).strip()), 1
+        if town and not _contains_address_keyword(town):
+            return CountryTown(country=None, town=town, postal_code=m.group(1).strip()), 1
 
     return CountryTown(country=None, town=_clean_town_value(last), postal_code=None), 1
 
+
 def parse_free_party_field(pre, field_type, role, message_id):
+    """Parse un champ libre (50K/59) avec conservation stricte des lignes adresses."""
     res = _empty(field_type, role, message_id, raw=pre.normalized_text or pre.raw_input)
     warnings = res.meta.warnings
     lines = pre.lines[:]
     idx = 0
     iban_country = pre.meta.iban_country
+
+    # 1. Extraction du compte
     if lines and lines[0].startswith("/"):
         res.account = lines[0]
         idx = 1
@@ -384,7 +491,7 @@ def parse_free_party_field(pre, field_type, role, message_id):
         res.meta.parse_confidence = 0.0
         return res
 
-    # CAS SPÉCIAL 1 : une seule ligne qui finit par un pays
+    # 2. CAS SPÉCIAL : une seule ligne finissant par un pays
     if len(content) == 1:
         only_line = content[0]
         up = only_line.upper()
@@ -403,19 +510,23 @@ def parse_free_party_field(pre, field_type, role, message_id):
                     res.meta.parse_confidence = 0.85
                     return res
 
+    # 3. Extraction géographique
     geo, consumed = _extract_geo_from_free_lines(content, warnings)
 
+    # ✅ CORRECTION CRITIQUE : Ne consomme QUE les lignes strictement géographiques
     if consumed > 0 and content:
-        last_line = _norm(content[-1])
-        frag = _extract_country_postal_town_fragment(last_line)
-        pure_geo_line = False
-        if frag:
-            start_idx, end_idx, _ = frag
-            frag_text = _norm(last_line[start_idx:end_idx])
-            if frag_text.upper() == last_line.upper(): pure_geo_line = True
-        else:
-            if not _is_address(last_line): pure_geo_line = True
-        if pure_geo_line: content = content[:-consumed]
+        indices_to_remove = []
+        for i in range(consumed):
+            line_idx = len(content) - 1 - i
+            if line_idx >= 0:
+                line = content[line_idx]
+                # Si la ligne contient un mot-clé adresse (CITE, ZONE, RUE...), on la garde
+                if not _contains_address_keyword(line):
+                    indices_to_remove.append(line_idx)
+        
+        # Suppression sécurisée (indices décroissants)
+        for idx in sorted(indices_to_remove, reverse=True):
+            content.pop(idx)
 
     geo = _apply_iban_and_capital_fallback(geo, iban_country, warnings)
     if not content:
@@ -425,7 +536,7 @@ def parse_free_party_field(pre, field_type, role, message_id):
         res.meta.parse_confidence = 0.80
         return res
 
-    # NOM
+    # 4. Parsing du NOM
     first = content[0]
     split_name, split_addr = _split_inline_name_address(first)
     if split_addr:
@@ -436,6 +547,8 @@ def parse_free_party_field(pre, field_type, role, message_id):
         res.name = [first]
 
     remaining = content[1:]
+
+    # Continuation org multi-ligne
     if remaining:
         candidate = _norm(remaining[0])
         looks_geo = (
@@ -448,23 +561,40 @@ def parse_free_party_field(pre, field_type, role, message_id):
             remaining = remaining[1:]
             warnings.append("multiline_name_fused:1")
 
-    # CAS SPÉCIAL 2 : [ligne candidate] + [pays]
+    # 5. CAS SPÉCIAL : [ligne candidate] + [pays]
     if len(remaining) == 2:
         line1 = _norm(remaining[0])
         line2 = _norm(remaining[1]).upper()
         line2_country = resolve_country_code(line2)
         if line2_country:
-            m = re.match(r"^(\d{4,6})\s+(.+)$", line1)
-            if m:
-                town = _clean_town_value(m.group(2).strip())
+            # ✅ EXTRACTION ZONE INDUSTRIELLE: "ZONE INDUSTRIELLE ENFIDHA" → town="ENFIDHA"
+            addr_part, town_from_zone = _extract_town_from_zone_line(line1)
+            if addr_part and town_from_zone and _is_known_city(town_from_zone):
+                # Zone industrielle avec ville: ajouter adresse, mettre town
+                if addr_part != "":
+                    res.address_lines.append(addr_part)
                 res.country_town = _apply_iban_and_capital_fallback(
-                    CountryTown(country=line2_country, town=town, postal_code=m.group(1).strip()),
+                    CountryTown(country=line2_country, town=town_from_zone, postal_code=None),
                     iban_country, warnings
                 )
                 res.address_lines = _deduplicate_addresses(res.address_lines)
+                warnings.append(f"zone_industrielle_extracted_town:{town_from_zone}")
                 res.is_org = _detect_org(res.name)
-                res.meta.parse_confidence = 0.88
+                res.meta.parse_confidence = 0.85
                 return res
+            
+            m = re.match(r"^(\d{4,6})\s+(.+)$", line1)
+            if m:
+                town = _clean_town_value(m.group(2).strip())
+                if town and not _contains_address_keyword(town):
+                    res.country_town = _apply_iban_and_capital_fallback(
+                        CountryTown(country=line2_country, town=town, postal_code=m.group(1).strip()),
+                        iban_country, warnings
+                    )
+                    res.address_lines = _deduplicate_addresses(res.address_lines)
+                    res.is_org = _detect_org(res.name)
+                    res.meta.parse_confidence = 0.85
+                    return res
 
             decision = resolve_city_country_ambiguity(line1, line2)
             if decision.label == "TOWN":
@@ -488,6 +618,7 @@ def parse_free_party_field(pre, field_type, role, message_id):
                 res.is_org = _detect_org(res.name)
                 res.meta.parse_confidence = decision.confidence
                 return res
+            
             res.country_town = _apply_iban_and_capital_fallback(
                 CountryTown(country=line2_country, town=line1, postal_code=None),
                 iban_country, warnings
@@ -498,10 +629,12 @@ def parse_free_party_field(pre, field_type, role, message_id):
             res.meta.parse_confidence = 0.65
             return res
 
-    # Lignes restantes
+    # 6. Traitement des lignes restantes
     for line in remaining:
         line = _norm(line)
-        if _is_postal_town_line(line, geo): continue
+        if _is_postal_town_line(line, geo):
+            continue
+        
         frag = _extract_country_postal_town_fragment(line)
         if frag:
             start_idx, _, ct = frag
@@ -509,27 +642,36 @@ def parse_free_party_field(pre, field_type, role, message_id):
             if not geo.town: geo.town = _clean_town_value(ct.town)
             if not geo.postal_code: geo.postal_code = ct.postal_code
             addr_part = _norm(line[:start_idx]).strip(" ,-/")
-            if addr_part: res.address_lines.append(addr_part)
+            if addr_part:
+                res.address_lines.append(addr_part)
             continue
-        if geo.town and _norm(line).upper() == _norm(geo.town).upper(): continue
+            
+        if geo.town and _norm(line).upper() == _norm(geo.town).upper():
+            continue
+            
         line_country = resolve_country_code(line)
         if line_country:
             if not geo.country: geo.country = line_country
             continue
+            
         res.address_lines.append(line) 
         if not _is_address(line):
             warnings.append(f"unclassified_line_to_address:{line}")
 
+    # 7. Reclassification : si la ville extraite ressemble à une adresse
     if geo.town and _looks_like_real_address_fragment(geo.town):
-        if geo.town not in res.address_lines: res.address_lines.insert(0, geo.town)
+        if geo.town not in res.address_lines:
+            res.address_lines.insert(0, geo.town)
         geo.town = None
         warnings.append("town_reclassified_as_address")
 
+    # 8. Finalisation
     geo = _apply_iban_and_capital_fallback(geo, iban_country, warnings)
     res.address_lines = _deduplicate_addresses(res.address_lines)
     res.country_town = geo
     res.is_org = _detect_org(res.name)
 
+    # Calcul de la confiance
     confidence = 0.90
     if "name_address_mixed" in warnings: confidence -= 0.05
     if any(w.startswith("multiline_name_fused") for w in warnings): confidence -= 0.05
@@ -541,7 +683,6 @@ def parse_free_party_field(pre, field_type, role, message_id):
 
     res.meta.parse_confidence = max(0.0, round(confidence, 2))
     return res
-
 def parse_structured_50F(pre, message_id="MSG"):
     res = _empty("50F", "debtor", message_id, raw=pre.normalized_text or pre.raw_input)
     warnings = res.meta.warnings

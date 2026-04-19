@@ -8,7 +8,7 @@ from src.config import ADDRESS_KEYWORDS, NOISE_PREFIXES, ORG_HINTS
 from src.logger import StepLogger
 from src.models import PreprocessMeta, PreprocessResult
 
-FIELD_TAG_PATTERN = re.compile(r"^\s*:(50F|50K|59F|59):", re.IGNORECASE)
+FIELD_TAG_PATTERN = re.compile(r"^\s*:?(50F|50K|59F|59):", re.IGNORECASE)
 IBAN_PATTERN = re.compile(r"\b([A-Z]{2})\d{2}[A-Z0-9]{8,30}\b", re.IGNORECASE)
 SWIFT_STRUCTURED_PREFIX_PATTERN = re.compile(r"^[1-8]/")
 

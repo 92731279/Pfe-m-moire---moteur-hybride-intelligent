@@ -12,7 +12,7 @@ from src.rejection_policy import apply_rejection_policy
 def run_pipeline(
     raw_message: str,
     message_id: str = "MSG_PIPELINE",
-    slm_model: str = "phi3:mini",
+    slm_model: str = "qwen2.5:0.5b",
     logger: PipelineLogger = None,
 ):
     logger = logger or PipelineLogger()
@@ -55,6 +55,18 @@ def run_pipeline(
     # E2.5 — Fragmentation d'adresse (NOUVEAU)
     logger.log("E2.5", "Début fragmentation adresse")
     e2 = fragment_party_address(e2)
+    
+    # --- BACKFILL depuis Fragmentation si E1 a échoué ---
+    if getattr(e2, 'fragmented_addresses', []) and e2.country_town:
+        for frag in e2.fragmented_addresses:
+            if frag.fragmentation_confidence > 0.8:
+                if not e2.country_town.town and frag.twn_nm:
+                    e2.country_town.town = frag.twn_nm
+                    e2.meta.warnings.append(f"pass2_town_backfilled_from_fragmentation:{frag.twn_nm}")
+                    e2.meta.parse_confidence = min(0.9, e2.meta.parse_confidence + 0.15)
+                if not e2.country_town.postal_code and frag.pst_cd:
+                    e2.country_town.postal_code = frag.pst_cd
+
     logger.log(
         "E2.5", "Fragmentation terminée",
         fragmented_count=len(getattr(e2, 'fragmented_addresses', [])),
@@ -86,6 +98,16 @@ def run_pipeline(
         logger.log("E2.5B", "Re-fragmentation après SLM")
         e2 = fragment_party_address(e2)
         
+        # --- BACKFILL depuis Fragmentation (Post-SLM) ---
+        if getattr(e2, 'fragmented_addresses', []) and e2.country_town:
+            for frag in e2.fragmented_addresses:
+                if frag.fragmentation_confidence > 0.8:
+                    if not e2.country_town.town and frag.twn_nm:
+                        e2.country_town.town = frag.twn_nm
+                        e2.meta.warnings.append(f"pass2_town_backfilled_from_fragmentation:{frag.twn_nm}")
+                    if not e2.country_town.postal_code and frag.pst_cd:
+                        e2.country_town.postal_code = frag.pst_cd
+
         logger.log(
             "E2B", "Revalidation terminée",
             confidence=e2.meta.parse_confidence,

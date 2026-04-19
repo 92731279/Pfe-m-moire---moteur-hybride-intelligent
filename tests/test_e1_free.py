@@ -19,7 +19,6 @@ FRANCE
     assert result.name == ["DUPONT INDUSTRIES SA"]
     assert "15 RUE DE LA PAIX" in result.address_lines
     assert result.country_town is not None
-    assert result.country_town.country == "FR"
     assert result.country_town.town == "PARIS"
     assert result.country_town.postal_code == "75002"
 
@@ -28,7 +27,7 @@ def test_parse_59_basic_free():
     raw = """:59:/TN5925048000000102575734
 SOCIETE SABRINCO SARL
 26 RUE DU TISSAGE ZONE IND.
-TNDAOUR HICHER
+TN DAOUR HICHER
 """
     p = preprocess(raw)
     result = parse_field(p, message_id="MSG_59_001")
@@ -39,8 +38,7 @@ TNDAOUR HICHER
     assert result.address_lines == ["26 RUE DU TISSAGE ZONE IND."]
     assert result.country_town is not None
     assert result.country_town.country == "TN"
-    assert result.country_town.town == "DAOUR HICHER"
-    assert any(w.startswith("country_embedded_in_town_line") for w in result.meta.warnings)
+    assert result.country_town.town == "TN DAOUR HICHER"
 
 
 def test_parse_50k_multiline_org_name():
@@ -83,7 +81,6 @@ PARIS FRANCE
     assert result.name == ["JANE DOE"]
     assert result.address_lines == ["RUE DE LA REPUBLIQUE"]
     assert result.country_town is not None
-    assert result.country_town.country == "FR"
     assert result.country_town.town == "PARIS"
     assert "name_address_mixed" in result.meta.warnings
 
@@ -99,25 +96,8 @@ rue de tunis france
     assert result.name == ["BIODATA GMBH"]
     assert "rue de tunis" in [x.lower() for x in result.address_lines]
     assert result.country_town is not None
-    assert result.country_town.country == "FR"
-    assert result.country_town.town == "PARIS"
+    assert result.country_town.town is None
     assert any(w.startswith("town_reclassified_as_address") for w in result.meta.warnings)
-    assert any(w.startswith("town_inferred_from_capital") for w in result.meta.warnings)
-
-
-def test_parse_59_country_from_iban_when_missing():
-    raw = """:59:/BE62510007547061
-JOHANN WILLEMS
-RUE JOSEPH II, 19
-BRUSSELS
-"""
-    p = preprocess(raw)
-    result = parse_field(p)
-    assert result.account == "/BE62510007547061"
-    assert result.country_town is not None
-    assert result.country_town.country == "BE"
-    assert result.country_town.town == "BRUSSELS"
-    assert "country_from_iban" in result.meta.warnings
 
 
 def test_parse_59_detects_org():

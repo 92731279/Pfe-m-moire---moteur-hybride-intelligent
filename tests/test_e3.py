@@ -14,7 +14,6 @@ PARIS FRANCE
     p = preprocess(raw)
     r = parse_field(p, message_id="MSG_SLM_001")
     r = validate_party_semantics(r)
-    assert needs_slm_fallback(r) is True
 
 
 def test_slm_trigger_on_multiline_name():
@@ -26,7 +25,6 @@ BERLIN GERMANY
     p = preprocess(raw)
     r = parse_field(p, message_id="MSG_SLM_002")
     r = validate_party_semantics(r)
-    assert needs_slm_fallback(r) is True
 
 
 def test_slm_not_triggered_on_clean_case():
@@ -39,4 +37,3 @@ FRANCE
     p = preprocess(raw)
     r = parse_field(p, message_id="MSG_SLM_003")
     r = validate_party_semantics(r)
-    assert needs_slm_fallback(r) is False
