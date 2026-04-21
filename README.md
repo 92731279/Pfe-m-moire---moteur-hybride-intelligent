@@ -16,24 +16,48 @@ Transformer des messages SWIFT de paiement (champs `50F/K` et `59F/-`) vers le f
 
 ```
 Message SWIFT brut
-       │
-       ▼
-  E0 — Prétraitement
-  (nettoyage, normalisation, détection IBAN/langue/entité)
-       │
-       ▼
-  E1 — Parsing
-  (structuré 50F/59F  |  libre 50K/59)
-       │
-       ▼
-  E2 — Validation sémantique
-  (Pass 1: country/town  |  Pass 2: address lines via libpostal)
-       │
-       ▼ (si ambigu)
-  E3 — SLM Fallback (Ollama / phi3:mini)
-       │
-       ▼
-  JSON canonique final
+        │
+        ▼
+E0 — Prétraitement
+(Nettoyage, normalisation, extraction IBAN, détection type entité)
+        │
+        ▼
+E1 — Parsing
+(Extraction des champs : nom, adresse, pays, ville)
+→ Support : 50K (libre) / 59 (structuré)
+        │
+        ▼
+E2 — Validation sémantique (2 passes)
+Pass 1 :
+- Validation country / town (GeoNames)
+- Résolution ambiguïté (ville vs suburb)
+
+Pass 2 :
+- Validation adresse (libpostal)
+- Cohérence géographique (adresse ↔ ville ↔ pays)
+        │
+        ▼
+E2.5 — Fragmentation ISO 20022
+- Mapping vers format structuré :
+  (StrtNm, BldgNb, TwnNm, Ctry…)
+- Fallback AdrLine si info insuffisante
+        │
+        ▼
+(si ambigu ou incohérent)
+        ▼
+E3 — SLM Fallback (Ollama)
+- Modèles : phi3:mini / qwen2.5:0.5b
+- Réinterprétation du message
+- Réinjection dans pipeline (revalidation E2)
+        │
+        ▼
+Décision métier
+- Accepté
+- Confiance faible (manual review)
+- Rejet (quarantaine)
+        │
+        ▼
+JSON canonique final (ISO 20022)
 ```
 
 ---
