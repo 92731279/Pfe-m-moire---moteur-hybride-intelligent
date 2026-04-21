@@ -41,7 +41,7 @@ def _map_libpostal_to_iso(
     room = _get_comp(components, "unit", "UNIT", "room", "ROOM")
     
     pst_cd = _get_comp(components, "postcode", "POSTCODE") or _safe_hint(postal_code_hint)
-    twn_nm = _get_comp(components, "city", "CITY") or _safe_hint(town_hint)
+    twn_nm = _safe_hint(town_hint) or _get_comp(components, "city", "CITY")
     ctry_sub_div = _get_comp(components, "state", "STATE", "suburb", "SUBURB")
     ctry = _safe_hint(country_hint) or _get_comp(components, "country", "COUNTRY")
 

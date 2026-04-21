@@ -79,10 +79,10 @@ PARIS FRANCE
     result = parse_field(p, message_id="MSG_E2_006")
     result.address_lines = ["XXXXXX"]
     result = validate_party_semantics(result)
-    assert any(
-        w.startswith("pass2_invalid_address_line")
+    assert(any(
+        w.startswith("pass2_soft:missing_road_like_component")
         for w in result.meta.warnings
-    )
+    ))
 
 
 def test_validate_structured_composite_town_reduced_to_core():
@@ -96,7 +96,7 @@ def test_validate_structured_composite_town_reduced_to_core():
     result = validate_party_semantics(result)
     assert result.country_town is not None
     assert result.country_town.country == "TN"
-    assert result.country_town.town is None
+    assert result.country_town.town == "TUNIS"
     assert not any(w.startswith("pass1_town_not_found_worldwide") for w in result.meta.warnings)
 
 

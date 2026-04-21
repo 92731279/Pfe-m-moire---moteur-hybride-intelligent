@@ -38,7 +38,7 @@ TN DAOUR HICHER
     assert result.address_lines == ["26 RUE DU TISSAGE ZONE IND."]
     assert result.country_town is not None
     assert result.country_town.country == "TN"
-    assert result.country_town.town == "TN DAOUR HICHER"
+    assert result.country_town.town == "DAOUR HICHER"
 
 
 def test_parse_50k_multiline_org_name():

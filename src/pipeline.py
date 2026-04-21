@@ -60,7 +60,7 @@ def run_pipeline(
     if getattr(e2, 'fragmented_addresses', []) and e2.country_town:
         for frag in e2.fragmented_addresses:
             if frag.fragmentation_confidence > 0.8:
-                if not e2.country_town.town and frag.twn_nm:
+                if not e2.country_town.town and frag.twn_nm and str(frag.twn_nm).upper() not in ["AVENUE", "RUE", "BOULEVARD", "STREET", "ZONE INDUSTRIELLE"]:
                     e2.country_town.town = frag.twn_nm
                     e2.meta.warnings.append(f"pass2_town_backfilled_from_fragmentation:{frag.twn_nm}")
                     e2.meta.parse_confidence = min(0.9, e2.meta.parse_confidence + 0.15)
@@ -102,7 +102,7 @@ def run_pipeline(
         if getattr(e2, 'fragmented_addresses', []) and e2.country_town:
             for frag in e2.fragmented_addresses:
                 if frag.fragmentation_confidence > 0.8:
-                    if not e2.country_town.town and frag.twn_nm:
+                    if not e2.country_town.town and frag.twn_nm and str(frag.twn_nm).upper() not in ["AVENUE", "RUE", "BOULEVARD", "STREET", "ZONE INDUSTRIELLE"]:
                         e2.country_town.town = frag.twn_nm
                         e2.meta.warnings.append(f"pass2_town_backfilled_from_fragmentation:{frag.twn_nm}")
                     if not e2.country_town.postal_code and frag.pst_cd:
@@ -113,6 +113,40 @@ def run_pipeline(
             confidence=e2.meta.parse_confidence,
             warnings=e2.meta.warnings,
         )
+
+    # --- GEO-KNOWLEDGE : Résolution Postale Implicite ---
+    def _enrich_city_via_postal(party):
+        if not party.country_town: return party
+        t = party.country_town.town
+        p = party.country_town.postal_code
+        c = party.country_town.country
+        
+        if not p and party.fragmented_addresses:
+            for frag in party.fragmented_addresses:
+                if frag.pst_cd:
+                    p = frag.pst_cd
+                    party.country_town.postal_code = p
+                    break
+        
+        mapping_tn = {
+            "2037": "ENNASR / ARIANA", "1000": "TUNIS", "2080": "ARIANA",
+            "3000": "SFAX", "4000": "SOUSSE", "8000": "NABEUL",
+            "1073": "MONTPLAISIR", "1053": "LES BERGES DU LAC", "2000": "BARDO",
+            "2070": "LA MARSA", "2078": "LA MARSA", "5000": "MONASTIR",
+            "6000": "GABES", "4011": "HAMMAM SOUSSE", "2016": "CARTHAGE"
+        }
+        
+        if c == "TN" and p:
+            import re
+            clean_p = re.sub(r"[^\d]", "", str(p))
+            if clean_p in mapping_tn:
+                if not t or str(t).strip() == "" or str(t).lower() == "none":
+                    party.country_town.town = mapping_tn[clean_p]
+                    if not party.meta.warnings: party.meta.warnings = []
+                    party.meta.warnings.append(f"geo_postal_resolution_{clean_p}")
+        return party
+
+    e2 = _enrich_city_via_postal(e2)
 
     e2 = apply_rejection_policy(e2)
     logger.log(

@@ -35,12 +35,19 @@ def parse_address_line(address_line: str) -> Dict:
 
     # 🛡️ CORRECTION SÉMANTIQUE : Reclassification avant normalisation
     NON_HOUSE_KEYWORDS = {"ZONE", "CITE", "CITÉ", "QUARTIER", "SECTEUR", "INDUSTRIELLE", 
-                          "INDUSTRIAL", "COMMERCIAL", "IMMEUBLE", "IMM", "BLOC", "PARC"}
+                          "INDUSTRIAL", "COMMERCIAL", "IMMEUBLE", "IMM", "BLOC", "PARC", "IND.", "IND", "ZI"}
     
     corrected_parsed = []
-    for value, label in parsed:
+    n_parsed = len(parsed)
+    for i, (value, label) in enumerate(parsed):
         val_upper = value.upper()
-        if label == "house" and any(kw in val_upper for kw in NON_HOUSE_KEYWORDS):
+        # Éviter les "CITY: ZONE" et "COUNTRY: IND." (blacklist de bruits géographiques)
+        if val_upper in {"ZONE", "IND.", "IND", "ZI", "INDUSTRIELLE", "INDUSTRIAL"} and label in {"city", "country", "state"}:
+            corrected_parsed.append((value, "suburb"))
+        elif label == "house_number" and i == n_parsed - 1 and len(val_upper) == 4 and val_upper.isdigit():
+            # Si Libpostal met un numéro de 4 chiffres strict à la FIN d'une ligne, c'est très probablement un Code Postal (TN/FR)
+            corrected_parsed.append((value, "postcode"))
+        elif label == "house" and any(kw in val_upper for kw in NON_HOUSE_KEYWORDS):
             corrected_parsed.append((value, "suburb"))
         else:
             corrected_parsed.append((value, label))
@@ -54,8 +61,8 @@ def parse_address_line(address_line: str) -> Dict:
             continue
         components.setdefault(label_norm, []).append(value_norm)
 
-    # Aplatir pour l'affichage/debug
-    flat_components = {k: " | ".join(v) for k, v in components.items()}
+    # Aplatir pour l'affichage/debug (et fusionner les éléments de même type comme ZONE et IND.)
+    flat_components = {k: " ".join(v) for k, v in components.items()}
 
     # Validation basique
     key_labels = {"ROAD", "HOUSE_NUMBER", "UNIT", "POSTCODE", "CITY", "SUBURB", "STATE", "COUNTRY"}

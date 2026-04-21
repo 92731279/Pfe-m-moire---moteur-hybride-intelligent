@@ -246,8 +246,8 @@ class E3SLMFallback:
         confidence = _meta_get(party.meta, 'parse_confidence', 0)
         warnings = _meta_get(party.meta, 'warnings', [])
         
-        # Pas besoin si déjà bonne confiance
-        if confidence >= 0.75:
+        # Pas besoin si déjà très bonne confiance et aucun signal fort
+        if confidence >= 0.85:
             return False
 
         if _is_simple_country_only_gap(party, warnings):
@@ -263,8 +263,13 @@ class E3SLMFallback:
             'ambiguous_city_country_tail',
             'name_address_mixed',
             'pass1_country_missing',
+            'pass1_missing_country_town',
             'pass1_town_not_found',
             'pass2_geo_incoherent',
+            'no_content_after_account',
+            'name_missing',
+            'requires_manual_verification',
+            'pass1_town_not_official'
         ]
         
         needs_slm = any(
@@ -378,11 +383,15 @@ class E3SLMFallback:
         prompt = f"""TÂCHE: Extraire les informations d'un message SWIFT {field_type}.
 
 RÈGLES STRICTES:
-1. name = UNIQUEMENT nom personne ou entreprise (pas adresse)
-2. address = rue/numéro/PO BOX/bâtiment (PAS ville, PAS pays)
-3. town = ville SEULE (PAS adresse, PAS pays, PAS postal)
-4. country = code ISO 2 lettres uniquement (FR, DE, CA, TN, AE, US, etc)
-5. postal = code postal ou - si absent
+1. name = UNIQUEMENT nom de la personne ou entreprise/société (ex: MONSIEUR BOURGUIBA HABIB, SOCIETE MEUBLATEX SA).
+2. address = rue/numéro/PO BOX/Z.I./bâtiment/APPARTEMENT. NE JAMAIS inclure la ville, le pays ou le code postal dans address.
+3. town = ville SEULE (PAS adresse, PAS pays, PAS postal) (ex: SOUSSE, ARIANA).
+4. country = code ISO 2 lettres obligatoirement (ex: FR, DE, US). Pour la Tunisie, le code STRICT est "TN" (NE JAMAIS ECRIRE "TU", NI "TUNISIE", NI "AT", NI "CH").
+5. postal = code postal ou - si absent (ex: 8000, 2037).
+6. Séparer le code ISO (ex: TN, FR, US) du nom de la ville s'ils sont collés.
+7. Attention aux textes inversés: Parfois l'adresse est au-dessus du nom de la société. Bien isoler (SOCIETE, SA, SARL, MONSIEUR) dans 'name'.
+8. Attention au Chaos Total: Parfois tout est sur une seule ligne. Séparez logiquement Nom, Rue, Postal et Ville.
+9. BIAIS LOCAL TUNISIE CACHÉ: Si aucune mention n'est explicite, mais qu'il y a des termes locaux (ARIANA, SFAX, ENNASR, MENZAH, BIZERTE, NABEUL, SOUSSE, CHOTRANA, MEUBLATEX), le pays (country) DOIT ÊTRE "TN" impérativement. Extraire la VRAIE ville dans "town" trouvée dans le texte.
 
 FORMAT RÉPONSE (5 lignes):
 name: <valeur>
@@ -401,12 +410,62 @@ town: PARIS
 country: FR
 postal: -
 
-Input: "MOHSEN ISMAIL\nPO BOX 25026 ABU DHABI\nUAE"
+Input: "/123456 MONSIEUR BOURGUIBA HABIB RUE DE LA LIBERTE APPT 4B 8000 NABEUL TUNISIE"
 Output:
-name: MOHSEN ISMAIL
-address: PO BOX 25026
-town: ABU DHABI
-country: AE
+name: MONSIEUR BOURGUIBA HABIB
+address: RUE DE LA LIBERTE APPT 4B
+town: NABEUL
+country: TN
+postal: 8000
+
+Input: "/TN4839\n2037 ARIANA\nZ.I. CHOTRANA 2\nSOCIETE MEUBLATEX SA\nATTN DIR FINANCIER"
+Output:
+name: SOCIETE MEUBLATEX SA ATTN DIR FINANCIER
+address: Z.I. CHOTRANA 2
+town: ARIANA
+country: TN
+postal: 2037
+
+Input: "SOCIETE SABRINCO SARL\n26 RUE DU TISSAGE ZONE IND.\nTNDAOUR HICHER"
+Output:
+name: SOCIETE SABRINCO SARL
+address: 26 RUE DU TISSAGE ZONE IND.
+town: DAOUR HICHER
+country: TN
+postal: -
+
+Input: "1/John Smith\n3/US/New York"
+Output:
+name: John Smith
+address: -
+town: NEW YORK
+country: US
+postal: -
+
+Input: "ELMI AHMED\n30 RUE AHMED AMINE EL OMRANE OMRANE(EL) TN/1005 OMRANE(EL)"
+Output:
+name: ELMI AHMED
+address: 30 RUE AHMED AMINE EL OMRANE
+town: OMRANE EL
+country: TN
+postal: 1005
+
+Input: "MONSIEUR ABDELKADER BEN SALEH\nCITE ENNASR PRES DE LA POSTE\nRTE X3 KM4\nARIANA 2037"
+Output:
+name: MONSIEUR ABDELKADER BEN SALEH
+address: CITE ENNASR PRES DE LA POSTE RTE X3 KM4
+town: ARIANA
+country: TN
+postal: 2037
+
+postal: 1005
+
+Input: "1/John Doe\n2/123 Main Street Taipei Taiwan\n3/JP/Taiwan"
+Output:
+name: John Doe
+address: 123 MAIN STREET
+town: TAIPEI
+country: TW
 postal: -
 
 ---
@@ -459,6 +518,9 @@ Output:"""
                 elif key == 'country':
                     # Normaliser le code pays
                     country = value.upper()[:2]
+                    # Force correct if the LLM is stubborn
+                    if country in ['TU', 'AT', 'CH']:
+                        country = 'TN'
                     if len(country) == 2 and country.isalpha():
                         result['country'] = country
                 elif key == 'postal':
@@ -498,31 +560,45 @@ Output:"""
             slm_name = slm_result['name']
             current_country = party.country_town.country if party.country_town else None
             
-            # Prendre le SLM si le nom actuel est "UNKNOWN" ou très court
-            if _name_just_appends_same_country(current_name, slm_name, current_country):
+            # Prendre prioritairement le nom du SLM si c'est un format 50K bruités
+            if party.field_type == "50K":
+                party.name = [slm_name]
+                updated = True
+                logger.debug(f"[E3] Nom forcé en 50K : {slm_name}")
+            elif _name_just_appends_same_country(current_name, slm_name, current_country):
                 pass
-            elif current_name == "UNKNOWN" or len(slm_name) > len(current_name):
+            elif current_name == "UNKNOWN" or len(slm_name) >= len(current_name) - 3 or not current_name:
                 party.name = [slm_name]
                 updated = True
                 logger.debug(f"[E3] Nom mis à jour: {slm_name}")
         
         # 2. Adresse (ajouter si manquante)
-        # Dans _apply_slm_result, remplace la section adresse par :
         sanitized_addresses = [line for line in slm_result.get('address_lines', []) 
                             if not _contains_account_text(line, party.account)]
-        # ✅ GARDE : Ne remplace QUE si vide, sinon fusionne intelligemment
-        if sanitized_addresses and not party.address_lines:
-            party.address_lines = sanitized_addresses
-        elif sanitized_addresses and party.address_lines:
-            # Évite les doublons, garde la rue si le SLM a juste renvoyé la ville
-            for addr in sanitized_addresses:
-                if addr not in party.address_lines:
-                    party.address_lines.append(addr)
+                            
+        # ✅ REDONDANCE : Nettoyer la ville, le code postal et le pays des lignes d'adresse
+        clean_address_lines = []
+        for line in sanitized_addresses:
+            c_line = line
+            if slm_result.get('town') and str(slm_result['town']).upper() in c_line.upper():
+                c_line = re.compile(re.escape(str(slm_result['town'])), re.IGNORECASE).sub('', c_line)
+            if slm_result.get('postal') and str(slm_result['postal']) in c_line:
+                c_line = c_line.replace(str(slm_result['postal']), '')
+            if slm_result.get('country') and str(slm_result['country']).upper() in c_line.upper():
+                c_line = re.compile(re.escape(str(slm_result['country'])), re.IGNORECASE).sub('', c_line)
+            # Retirer aussi les mots comme "TUNISIE" si present
+            c_line = re.compile(r'\b(?:TUNISIE|TUNISIA|TUN|TU)\b', re.IGNORECASE).sub('', c_line)
             
-        if sanitized_addresses and not party.address_lines:
-            party.address_lines = sanitized_addresses
-            updated = True
-            logger.debug(f"[E3] Adresse ajoutée: {sanitized_addresses}")
+            c_line = c_line.strip(',.- ')
+            # Retirer les espaces multiples cachés (regex)
+            c_line = re.sub(r'\s{2,}', ' ', c_line).strip()
+            
+            if len(c_line) > 1:
+                clean_address_lines.append(c_line)
+
+        party.address_lines = clean_address_lines
+        updated = True
+        logger.debug(f"[E3] Adresse mise à jour et nettoyée: {clean_address_lines}")
         
         # 3. Pays (priorité si manquant ou différent de l'IBAN)
         if slm_result.get('country'):
@@ -544,17 +620,18 @@ Output:"""
             current_town = party.country_town.town if party.country_town else ''
             slm_town = slm_result['town']
             
-            # Prendre le SLM si la ville actuelle contient des mots d'adresse
+            # Prendre le SLM si la ville actuelle contient des mots d'adresse ou est fausse
             address_keywords = ['PO BOX', 'RUE', 'STREET', 'AVENUE', 'DEPT', 'DEPARTMENT']
             has_address_words = bool(current_town) and any(kw in current_town for kw in address_keywords)
             
-            if not current_town or has_address_words or len(slm_town) < len(current_town):
+            # Priorité absolue au SLM pour corriger les villes
+            if not current_town or current_town == "UNKNOWN" or has_address_words or len(slm_town) >= 3:
                 if not party.country_town:
                     party.country_town = CountryTown(country=None, town=slm_town, postal_code=None)
                 else:
                     party.country_town.town = slm_town
                 updated = True
-                logger.debug(f"[E3] Ville mise à jour: {slm_town}")
+                logger.debug(f"[E3] Ville mise à jour par SLM: {slm_town}")
         
         # 5. Code postal
         if slm_result.get('postal_code'):

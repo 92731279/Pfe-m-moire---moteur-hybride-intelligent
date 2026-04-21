@@ -23,7 +23,7 @@ VALID_COUNTRIES: Set[str] = set(COUNTRY_CODES)
 
 def _norm(value: Optional[str]) -> str:
     if not value: return ""
-    return "".join(value.strip().upper().split())
+    return " ".join(value.strip().upper().split())
 
 def _append_warning_once(warnings: List[str], warning: str) -> None:
     if warning not in warnings:
@@ -55,7 +55,7 @@ def _validate_pass1_country_town(party: CanonicalParty) -> Tuple[str, str, bool,
     warnings = party.meta.warnings
     geo = party.country_town
     country = _norm(geo.country) if geo else ""
-    town_raw = _norm(geo.town) if geo else ""
+    town_raw = canonicalize_toponym(_norm(geo.town)) if geo else ""
 
     # 1. 🔍 Détection du contexte "suburb/quartier" dans les lignes d'adresse brutes
     SUBURB_KEYWORDS = {"CITE", "CITÉ", "ZONE", "QUARTIER", "SECTEUR", "IMMEUBLE", "IMM", "LOTISSEMENT"}
@@ -73,14 +73,14 @@ def _validate_pass1_country_town(party: CanonicalParty) -> Tuple[str, str, bool,
             if has_suburb_context:
                 warnings.append("pass1_town_extracted_from_suburb_and_confirmed")
             
-            # ✅ NEW: Résoudre la hiérarchie géographique (Enfidha → Sousse)
+            # ✅ CORRECTION: Conserver la localité exacte (ex: Douar Hicher) au lieu de promouvoir!
             parent_town = resolve_locality_hierarchy(country, town_raw)
             if parent_town and parent_town.upper() != canonical.upper():
-                # C'est une localité avec un parent administratif
-                warnings.append(f"pass1_locality_promoted_to_parent:{canonical}→{parent_town}")
-                return country, parent_town.upper(), True, False
+                # C'est une localité avec un parent administratif, mais on garde la localité précise
+                warnings.append(f"pass1_locality_has_parent:{canonical}→{parent_town}")
+                return country, canonical.upper(), True, False
             
-            return country, canonical.upper(), True, False
+            return country, town_raw.upper(), True, False
         else:
             warnings.append(f"pass1_town_not_official:{town_raw}")
             if is_town_literally_a_suburb:
@@ -133,7 +133,7 @@ def _validate_pass2_address_lines(party: CanonicalParty, country: str, town: str
         components = parsed.get("components", {}) or {}
 
         intrinsic_valid = bool(parsed.get("is_valid"))
-        key_labels = {"road", "house_number", "unit", "po_box", "house"}
+        key_labels = {"road", "house_number", "unit", "po_box", "house", "suburb", "city_district"}
         locally_plausible = bool(set(components.keys()) & key_labels)
         
         geo_consistent = _check_address_geo_consistency(components, line, town, country, geo_coherent)
@@ -157,11 +157,12 @@ def _validate_pass2_address_lines(party: CanonicalParty, country: str, town: str
         }
         results.append(result)
         
-        if contextual_valid: valid_count += 1
-        if contains_town_or_country:
-            _append_warning_once(warnings, f"pass2_address_contains_town_or_country:{line}")
-        if not intrinsic_valid:
-            _append_warning_once(warnings, f"pass2_address_contextually_accepted:{line}")
+        if contextual_valid:
+            valid_count += 1
+            if contains_town_or_country:
+                _append_warning_once(warnings, f"pass2_address_contains_town_or_country:{line}")
+            if not intrinsic_valid:
+                _append_warning_once(warnings, f"pass2_address_contextually_accepted:{line}")
         else:
             _append_warning_once(warnings, f"pass2_invalid_address_line:{line}")
             party.meta.parse_confidence = min(party.meta.parse_confidence, 0.70)

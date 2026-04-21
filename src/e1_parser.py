@@ -35,15 +35,17 @@ def _empty(field_type, role, message_id, raw=None):
     )
 
 def _all_known_cities_upper():
-    result = set()
-    for _, cities in CITIES_BY_COUNTRY.items():
-        for city in cities: result.add(_norm(city).upper())
+    result = {}
+    for country, cities in CITIES_BY_COUNTRY.items():
+        for city in cities: result[_norm(city).upper()] = country
     return result
 
 KNOWN_CITIES = _all_known_cities_upper()
 
+from src.toponym_normalizer import canonicalize_toponym
 def _is_known_country_name(line): return resolve_country_code(line) is not None
-def _is_known_city(line): return _norm(line).upper() in KNOWN_CITIES
+def _is_known_city(line): return canonicalize_toponym(_norm(line).upper()) in KNOWN_CITIES
+def _known_city_country(line): return KNOWN_CITIES.get(canonicalize_toponym(_norm(line).upper()))
 def _contains_address_keyword(value):
     up = _norm(value).upper()
     if not up: return False
@@ -211,7 +213,8 @@ def _split_embedded_country_prefix(line):
         "OUA", "PHN", "PHO", "POR", "POD", "PRA", "PRE", "QUI", "REY",
         "ROM", "ROT", "SAN", "SEO", "SEV", "SKO", "SOF", "STO", "SYD",
         "TAI", "TAS", "TAL", "TEH", "THE", "TIR", "TUN", "ULA", "VAL", "VAN",
-        "VIE", "VIL", "WAR", "WAS", "YAO", "YER", "ZAG",
+        "VIE", "VIL", "WAR", "WAS", "YAO", "YER", "ZAG", 
+        "TNO", "TNI", "TNE", # Eviter de splitter TNO/TNI si ca design un lieu local
     )
     
     # Garde 3: Si la ligne commence par un mot protégé → pas un pays collé
@@ -231,7 +234,7 @@ def _split_embedded_country_prefix(line):
     if " " in rest and len(rest.split()) >= 2:
         # Vérifier si le premier mot du reste n'est pas une ville connue
         first_word = rest.split()[0].upper()
-        if first_word not in KNOWN_CITIES and first_word not in COUNTRY_CODES:
+        if first_word not in KNOWN_CITIES and first_word not in COUNTRY_CODES and rest.upper() not in KNOWN_CITIES:
             return None, raw
     
     # ✅ Dernière vérification: le préfixe doit être suivi d'un séparateur ou d'une majuscule
@@ -339,7 +342,8 @@ def _extract_country_postal_town_fragment(line):
             if town: return m.start(), m.end(), CountryTown(country=cc, town=town, postal_code=m.group(2))
 
     # 3. ✅ NOUVEAU: Format PAYS VILLE POSTAL (ex: TN ELHAOUARIA 8045)
-    m = re.search(r"\b([A-Z]{2})\s+([A-Z][A-Z0-9()' .\-]+)\s+(\d{3,10})$", raw, flags=re.IGNORECASE)
+    # On restreint au début de chaîne ou après un séparateur pour éviter de capturer "AVENUE DE PARIS 1000" comme DE (Allemagne)
+    m = re.search(r"(?:^|[,/\-]\s*)([A-Z]{2})\s+([A-Z][A-Z0-9()' .\-]+)\s+(\d{3,10})$", raw, flags=re.IGNORECASE)
     if m:
         cc = m.group(1).upper()
         if cc in COUNTRY_CODES:
@@ -398,7 +402,7 @@ def _extract_geo_from_free_lines(lines, warnings):
             return CountryTown(country=encoded.country, town=None, postal_code=None), 1
 
     # 2. Ville connue seule
-    if _is_known_city(last): return CountryTown(country=None, town=last, postal_code=None), 1
+    if _is_known_city(last): return CountryTown(country=_known_city_country(last), town=last, postal_code=None), 1
 
     # 3. Fragment pays/postal/ville
     frag = _extract_country_postal_town_fragment(last)
