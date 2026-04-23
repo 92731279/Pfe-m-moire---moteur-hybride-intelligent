@@ -1,6 +1,7 @@
 """src/e2_address_fragmentation.py — Fragmentation d'adresse vers ISO 20022
 ALIGNÉ AVEC: e2_address_parser.py (Clés MAJUSCULES, Valeurs avec espaces)
 """
+import re
 from typing import Optional, List, Dict, Any
 from src.models import CanonicalParty, FragmentedAddress
 from src.e2_address_parser import parse_address_line
@@ -39,6 +40,10 @@ def _map_libpostal_to_iso(
     bldg_nb = _get_comp(components, "house_number", "HOUSE_NUMBER")
     bldg_nm = _get_comp(components, "house_name", "HOUSE_NAME", "house", "HOUSE")
     room = _get_comp(components, "unit", "UNIT", "room", "ROOM")
+
+    if bldg_nb and not re.search(r"\d", str(bldg_nb)):
+        bldg_nm = bldg_nm or bldg_nb
+        bldg_nb = None
     
     pst_cd = _get_comp(components, "postcode", "POSTCODE") or _safe_hint(postal_code_hint)
     twn_nm = _safe_hint(town_hint) or _get_comp(components, "city", "CITY")

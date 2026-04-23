@@ -128,6 +128,16 @@ def _generate_variants(town: str) -> list:
         if t.startswith(prefix):
             variants.append(t[len(prefix):])
 
+    # Abréviations françaises courantes
+    if t.startswith("ST "):
+        variants.append("SAINT " + t[3:])
+    if t.startswith("STE "):
+        variants.append("SAINTE " + t[4:])
+    if t.startswith("SAINT "):
+        variants.append("ST " + t[6:])
+    if t.startswith("SAINTE "):
+        variants.append("STE " + t[7:])
+
     # Dédoublonnage
     seen = set()
     result = []

@@ -279,10 +279,15 @@ def _parse_structured_country_town(value):
     if country not in COUNTRY_CODES: return None, False
     postal_code = None
     town = rest
-    m = re.match(r"^(.*?)(?:\s+([0-9A-Z-]{3,10}))$", rest)
-    if m and re.search(r"\d", m.group(2)):
-        town = m.group(1).strip(",")
-        postal_code = m.group(2).strip()
+    m = re.match(r"^(\d{3,10})\s+(.+)$", rest)
+    if m:
+        postal_code = m.group(1).strip()
+        town = m.group(2).strip(",")
+    else:
+        m = re.match(r"^(.*?)(?:\s+([0-9A-Z-]{3,10}))$", rest)
+        if m and re.search(r"\d", m.group(2)):
+            town = m.group(1).strip(",")
+            postal_code = m.group(2).strip()
     town = _clean_town_value(town)
     return CountryTown(country=country, town=town or None, postal_code=postal_code), True
 

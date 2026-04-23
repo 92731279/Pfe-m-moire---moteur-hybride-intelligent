@@ -1,0 +1,111 @@
+✅ GeoNames disponible pour validation
+[INPUT] Message reçu {'chars': 85}
+[E0] Début prétraitement {}
+[E0] Prétraitement terminé {'field_type': '50K', 'iban_country': None, 'entity_hint': 'OrgId', 'lines': 5}
+[E1] Début parsing {}
+[E1] Parsing terminé {'confidence': 0.85, 'warnings': 2, 'name': ['ARIANA'], 'address_lines': ["AVENUE DE L'UMA LA SOUKRA", 'SOCIETE MEUBLATEX SA'], 'country': 'AT', 'town': 'TN DIR FINANCIER'}
+[E2] Début validation sémantique {}
+[E2] Validation sémantique terminée {'confidence': 0.6, 'warnings': ['country_embedded_in_town_line:AT', 'unclassified_line_to_address:SOCIETE MEUBLATEX SA', 'pass1_town_not_official:TN DIR FINANCIER', 'requires_manual_verification:town_unverified', 'pass1_town_ambiguous_requires_disambiguation', 'pass2_invalid_address_line:SOCIETE MEUBLATEX SA', 'pass2_libpostal:missing_road_like_component', 'pass2_geo_incoherent_cannot_validate_address']}
+[E2.5] Début fragmentation adresse {}
+[E2.5] Fragmentation terminée {'fragmented_count': 2, 'confidence_avg': 0.7350000000000001}
+[E3] Décision fallback SLM {'use_slm': True}
+[E3] Appel SLM en cours {'model': 'qwen2.5:0.5b'}
+[E3] SLM terminé {'llm_signals': ['slm_applied'], 'fallback_used': True}
+[E2B] Revalidation après SLM {}
+[E2.5B] Re-fragmentation après SLM {}
+[E2B] Revalidation terminée {'confidence': 0.85, 'warnings': ['country_embedded_in_town_line:AT', 'unclassified_line_to_address:SOCIETE MEUBLATEX SA', 'pass1_town_not_official:TN DIR FINANCIER', 'pass1_town_ambiguous_requires_disambiguation', 'pass2_invalid_address_line:SOCIETE MEUBLATEX SA', 'pass2_libpostal:missing_road_like_component', 'pass2_geo_incoherent_cannot_validate_address', 'pass2_town_backfilled_from_fragmentation:LA SOUKRA', 'pass1_town_confirmed_geonames:alternate']}
+[DECISION] Décision métier {'rejected': False, 'rejection_reasons': []}
+[OUTPUT] Pipeline terminé {}
+{
+  "message_id": "BUG_MEUBLATEX",
+  "field_type": "50K",
+  "role": "debtor",
+  "raw": "/TN4839\nARIANA\navenue de l'uma La soukra\nSOCIETE MEUBLATEX SA\nATTN DIR FINANCIER",
+  "account": "/TN4839",
+  "party_id": null,
+  "name": [
+    "SOCIETE MEUBLATEX SA ATTN DIR FINANCIER"
+  ],
+  "address_lines": [
+    "AVENUE DE L'UMA LA SOUKRA"
+  ],
+  "country_town": {
+    "country": "TN",
+    "town": "ARIANA",
+    "postal_code": "2037"
+  },
+  "dob": null,
+  "pob": null,
+  "org_id": null,
+  "national_id": null,
+  "postal_complement": null,
+  "is_org": null,
+  "meta": {
+    "source_format": "50K",
+    "parse_confidence": 0.85,
+    "warnings": [
+      "country_embedded_in_town_line:AT",
+      "unclassified_line_to_address:SOCIETE MEUBLATEX SA",
+      "pass1_town_not_official:TN DIR FINANCIER",
+      "pass2_invalid_address_line:SOCIETE MEUBLATEX SA",
+      "pass2_libpostal:missing_road_like_component",
+      "pass2_geo_incoherent_cannot_validate_address",
+      "pass2_town_backfilled_from_fragmentation:LA SOUKRA",
+      "pass1_town_confirmed_geonames:alternate"
+    ],
+    "llm_signals": [
+      "slm_applied"
+    ],
+    "fallback_used": true,
+    "rejected": false,
+    "rejection_reasons": []
+  },
+  "address_validation": [
+    {
+      "raw": "AVENUE DE L'UMA LA SOUKRA",
+      "parsed": [
+        [
+          "avenue de l'uma",
+          "road"
+        ],
+        [
+          "la soukra",
+          "city"
+        ]
+      ],
+      "components": {
+        "ROAD": "AVENUE DE L'UMA",
+        "CITY": "LA SOUKRA"
+      },
+      "is_valid": true,
+      "warnings": [],
+      "pass": 2,
+      "contextual_valid": true,
+      "contextual_checks": {
+        "intrinsic_valid": true,
+        "locally_plausible": false,
+        "geo_consistent_with_pass1": true,
+        "contains_town_or_country": false,
+        "geo_coherent_pass1": true,
+        "town": "ARIANA",
+        "country": "TN"
+      }
+    }
+  ],
+  "fragmented_addresses": [
+    {
+      "strt_nm": "AVENUE DE L'UMA",
+      "bldg_nb": null,
+      "bldg_nm": null,
+      "flr": null,
+      "room": null,
+      "pst_cd": "2037",
+      "twn_nm": "ARIANA",
+      "ctry_sub_div": null,
+      "ctry": "TN",
+      "adr_line": [],
+      "fragmentation_confidence": 0.92,
+      "fallback_used": false
+    }
+  ]
+}

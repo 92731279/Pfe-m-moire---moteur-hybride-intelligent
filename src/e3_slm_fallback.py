@@ -130,6 +130,41 @@ def _name_just_appends_same_country(current_name: str, slm_name: str, country_co
     return resolve_country_code(suffix) == country_code
 
 
+def _restore_unit_identifier(address_line: str, raw_source: Optional[str]) -> str:
+    """Restaure un identifiant d'unité (ex: APPT 4B) perdu par le SLM si le brut le contient."""
+    if not address_line or not raw_source:
+        return address_line
+
+    raw_upper = str(raw_source).upper()
+    addr_upper = address_line.upper()
+    unit_keywords = ("APT", "APPT", "APPARTEMENT", "APP", "UNIT", "ROOM", "RM", "SUITE", "STE", "BUREAU")
+
+    for keyword in unit_keywords:
+        if keyword not in addr_upper:
+            continue
+
+        if re.search(rf"\b{re.escape(keyword)}\s+[A-Z0-9-]+\b", addr_upper):
+            return address_line
+
+        raw_match = re.search(rf"\b{re.escape(keyword)}\s+([A-Z0-9-]+)\b", raw_upper)
+        if not raw_match:
+            continue
+
+        unit_value = raw_match.group(1).strip()
+        if not unit_value:
+            continue
+
+        return re.sub(
+            rf"\b{re.escape(keyword)}\b",
+            f"{keyword} {unit_value}",
+            address_line,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    return address_line
+
+
 # =============================================================================
 # CACHE SLM (évite les appels répétés)
 # =============================================================================
@@ -145,7 +180,8 @@ class SLMCache:
     
     def _get_key(self, text: str) -> str:
         """Génère une clé de cache"""
-        return hashlib.md5(text.encode()).hexdigest()[:16]
+        # Ajout d'une version pour forcer l'invalidation de l'ancien cache corrompu
+        return hashlib.md5((text + "_v3_cache_invalidation").encode()).hexdigest()[:16]
     
     def get(self, text: str) -> Optional[Dict[str, Any]]:
         """Récupère du cache"""
@@ -212,6 +248,9 @@ class E3SLMFallback:
         
         # Vérifier le cache
         cache_key = party.raw or str(party.message_id)
+        
+        
+            
         cached = _slm_cache.get(cache_key)
         if cached:
             logger.info("[E3] Utilisation du cache SLM")
@@ -375,23 +414,16 @@ class E3SLMFallback:
         """
         raw = party.raw or ""
         field_type = party.field_type
-        current_warnings = _meta_get(party.meta, 'warnings', [])
-        
-        issues = ", ".join([str(w) for w in current_warnings[:3]]) if current_warnings else "aucun"
         
         # Format strict: EXEMPLES D'ABORD, puis vraies données à la fin
         prompt = f"""TÂCHE: Extraire les informations d'un message SWIFT {field_type}.
 
 RÈGLES STRICTES:
-1. name = UNIQUEMENT nom de la personne ou entreprise/société (ex: MONSIEUR BOURGUIBA HABIB, SOCIETE MEUBLATEX SA).
+1. name = UNIQUEMENT nom de la personne ou entreprise/société.
 2. address = rue/numéro/PO BOX/Z.I./bâtiment/APPARTEMENT. NE JAMAIS inclure la ville, le pays ou le code postal dans address.
-3. town = ville SEULE (PAS adresse, PAS pays, PAS postal) (ex: SOUSSE, ARIANA).
-4. country = code ISO 2 lettres obligatoirement (ex: FR, DE, US). Pour la Tunisie, le code STRICT est "TN" (NE JAMAIS ECRIRE "TU", NI "TUNISIE", NI "AT", NI "CH").
-5. postal = code postal ou - si absent (ex: 8000, 2037).
-6. Séparer le code ISO (ex: TN, FR, US) du nom de la ville s'ils sont collés.
-7. Attention aux textes inversés: Parfois l'adresse est au-dessus du nom de la société. Bien isoler (SOCIETE, SA, SARL, MONSIEUR) dans 'name'.
-8. Attention au Chaos Total: Parfois tout est sur une seule ligne. Séparez logiquement Nom, Rue, Postal et Ville.
-9. BIAIS LOCAL TUNISIE CACHÉ: Si aucune mention n'est explicite, mais qu'il y a des termes locaux (ARIANA, SFAX, ENNASR, MENZAH, BIZERTE, NABEUL, SOUSSE, CHOTRANA, MEUBLATEX), le pays (country) DOIT ÊTRE "TN" impérativement. Extraire la VRAIE ville dans "town" trouvée dans le texte.
+3. town = ville SEULE (PAS adresse, PAS pays, PAS postal).
+4. country = code ISO 2 lettres obligatoirement (ex: TN, FR).
+5. postal = code postal ou - si absent.
 
 FORMAT RÉPONSE (5 lignes):
 name: <valeur>
@@ -400,7 +432,7 @@ town: <valeur>
 country: <XX>
 postal: <valeur ou ->
 
-EXEMPLES (copier ce format):
+EXEMPLES:
 
 Input: "JANE DOE\nRUE DE LA PAIX\nPARIS FRANCE"
 Output:
@@ -410,14 +442,6 @@ town: PARIS
 country: FR
 postal: -
 
-Input: "/123456 MONSIEUR BOURGUIBA HABIB RUE DE LA LIBERTE APPT 4B 8000 NABEUL TUNISIE"
-Output:
-name: MONSIEUR BOURGUIBA HABIB
-address: RUE DE LA LIBERTE APPT 4B
-town: NABEUL
-country: TN
-postal: 8000
-
 Input: "/TN4839\n2037 ARIANA\nZ.I. CHOTRANA 2\nSOCIETE MEUBLATEX SA\nATTN DIR FINANCIER"
 Output:
 name: SOCIETE MEUBLATEX SA ATTN DIR FINANCIER
@@ -426,22 +450,6 @@ town: ARIANA
 country: TN
 postal: 2037
 
-Input: "SOCIETE SABRINCO SARL\n26 RUE DU TISSAGE ZONE IND.\nTNDAOUR HICHER"
-Output:
-name: SOCIETE SABRINCO SARL
-address: 26 RUE DU TISSAGE ZONE IND.
-town: DAOUR HICHER
-country: TN
-postal: -
-
-Input: "1/John Smith\n3/US/New York"
-Output:
-name: John Smith
-address: -
-town: NEW YORK
-country: US
-postal: -
-
 Input: "ELMI AHMED\n30 RUE AHMED AMINE EL OMRANE OMRANE(EL) TN/1005 OMRANE(EL)"
 Output:
 name: ELMI AHMED
@@ -449,24 +457,6 @@ address: 30 RUE AHMED AMINE EL OMRANE
 town: OMRANE EL
 country: TN
 postal: 1005
-
-Input: "MONSIEUR ABDELKADER BEN SALEH\nCITE ENNASR PRES DE LA POSTE\nRTE X3 KM4\nARIANA 2037"
-Output:
-name: MONSIEUR ABDELKADER BEN SALEH
-address: CITE ENNASR PRES DE LA POSTE RTE X3 KM4
-town: ARIANA
-country: TN
-postal: 2037
-
-postal: 1005
-
-Input: "1/John Doe\n2/123 Main Street Taipei Taiwan\n3/JP/Taiwan"
-Output:
-name: John Doe
-address: 123 MAIN STREET
-town: TAIPEI
-country: TW
-postal: -
 
 ---
 
@@ -592,6 +582,7 @@ Output:"""
             c_line = c_line.strip(',.- ')
             # Retirer les espaces multiples cachés (regex)
             c_line = re.sub(r'\s{2,}', ' ', c_line).strip()
+            c_line = _restore_unit_identifier(c_line, party.raw or party.account)
             
             if len(c_line) > 1:
                 clean_address_lines.append(c_line)

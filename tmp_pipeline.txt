@@ -1,72 +1,3 @@
-"""pipeline.py — Orchestration complète du moteur hybride SWIFT"""
-
-from src.e0_preprocess import preprocess
-from src.e1_parser import parse_field
-from src.e2_validator import validate_party_semantics
-from src.e2_address_fragmentation import fragment_party_address
-from src.e3_slm_fallback import needs_slm_fallback, apply_slm_fallback
-from src.pipeline_logger import PipelineLogger
-from src.rejection_policy import apply_rejection_policy
-
-
-def _recalibrate_confidence_after_slm(party):
-    """Remonte la confiance si le fallback SLM est confirmé par les validations aval."""
-    if not getattr(party.meta, "fallback_used", False):
-        return party
-
-    warnings = list(getattr(party.meta, "warnings", []) or [])
-    llm_signals = set(getattr(party.meta, "llm_signals", []) or [])
-    if "slm_applied" not in llm_signals:
-        return party
-
-    current = float(getattr(party.meta, "parse_confidence", 0.0) or 0.0)
-    geo = getattr(party, "country_town", None)
-    valid_addresses = [
-        item for item in (getattr(party, "address_validation", []) or [])
-        if item.get("contextual_valid")
-    ]
-    best_fragmentation = max(
-        (float(getattr(frag, "fragmentation_confidence", 0.0) or 0.0)
-         for frag in (getattr(party, "fragmented_addresses", []) or [])),
-        default=0.0,
-    )
-
-    recovered_from_empty_parse = "no_content_after_account" in warnings
-    geonames_exact = any("pass1_town_confirmed_geonames:exact" in str(w) for w in warnings)
-    geonames_alt = any("pass1_town_confirmed_geonames:alternate" in str(w) for w in warnings)
-
-    floor = current
-    if geo and geo.country and geo.town:
-        floor = max(floor, 0.58 if recovered_from_empty_parse else 0.50)
-    if geo and geo.postal_code:
-        floor = max(floor, 0.62)
-    if geonames_alt:
-        floor = max(floor, 0.72)
-    if geonames_exact:
-        floor = max(floor, 0.76)
-    if valid_addresses:
-        floor = max(floor, 0.74)
-    if best_fragmentation >= 0.80:
-        floor = max(floor, 0.78 if geonames_exact else 0.75)
-
-    bonus = 0.0
-    if geo and geo.country and geo.town:
-        bonus += 0.05
-    if geo and geo.postal_code:
-        bonus += 0.03
-    if geonames_alt:
-        bonus += 0.05
-    if geonames_exact:
-        bonus += 0.07
-    if valid_addresses:
-        bonus += min(0.04, 0.02 * len(valid_addresses))
-    if best_fragmentation >= 0.80:
-        bonus += 0.03
-
-    party.meta.parse_confidence = round(min(0.90, max(floor, current + bonus)), 2)
-    return party
-
-
 def run_pipeline(
     raw_message: str,
     message_id: str = "MSG_PIPELINE",
@@ -168,8 +99,6 @@ def run_pipeline(
                     if not e2.country_town.postal_code and frag.pst_cd:
                         e2.country_town.postal_code = frag.pst_cd
 
-        e2 = _recalibrate_confidence_after_slm(e2)
-
         logger.log(
             "E2B", "Revalidation terminée",
             confidence=e2.meta.parse_confidence,
@@ -270,22 +199,3 @@ def run_pipeline(
         rejected=e2.meta.rejected,
         rejection_reasons=e2.meta.rejection_reasons,
     )
-
-
-    logger.log("OUTPUT", "Pipeline terminé")
-
-    # 🧹 CLEANUP POST-IA pour 50F/59F: Retirer les tags "1/", "2/", "3/" réinjectés par erreur
-    if getattr(e2.meta, "detected_field_type", "") in ["50F", "59F"] or getattr(e0.meta, "detected_field_type", "") in ["50F", "59F"]:
-        import re
-        if e2.name:
-            e2.name = [re.sub(r'^[0-9]+/', '', n).strip() for n in e2.name]
-        if e2.address_lines:
-            e2.address_lines = [re.sub(r'^[0-9]+/', '', a).strip() for a in e2.address_lines]
-        if getattr(e2, "fragmented_addresses", []):
-            for frag in e2.fragmented_addresses:
-                if getattr(frag, "bldg_nb", None):
-                    frag.bldg_nb = re.sub(r'^[0-9]+/', '', frag.bldg_nb).strip()
-                if getattr(frag, "adr_line", None):
-                    frag.adr_line = [re.sub(r'^[0-9]+/', '', a).strip() for a in frag.adr_line]
-
-    return e2, e0

@@ -40,6 +40,31 @@ def _build_city_to_country_index() -> Dict[str, str]:
 
 CITY_TO_COUNTRY = _build_city_to_country_index()
 
+
+def _infer_town_from_address_lines(country: str, address_lines: List[str]) -> Optional[str]:
+    if not country or not address_lines:
+        return None
+
+    known_cities = CITIES_BY_COUNTRY.get(country, []) or []
+    if not known_cities:
+        return None
+
+    normalized_candidates = []
+    for city in known_cities:
+        city_n = canonicalize_toponym(_norm(city))
+        if city_n:
+            normalized_candidates.append(city_n)
+
+    for line in address_lines:
+        line_n = canonicalize_toponym(_norm(line))
+        if not line_n:
+            continue
+        for city_n in normalized_candidates:
+            pattern = rf"(?:^|\b){re.escape(city_n)}(?:\b|$)"
+            if re.search(pattern, line_n):
+                return city_n
+    return None
+
 # ============================================================
 # PASS 1 — Validation géographique country/town
 # ============================================================
@@ -68,10 +93,13 @@ def _validate_pass1_country_town(party: CanonicalParty) -> Tuple[str, str, bool,
     # 2. ✅ Validation GeoNames PRIORITAIRE (si la ville existe, on la garde / la promeut)
     if GEONAMES_AVAILABLE and country and town_raw:
         is_valid, canonical, matched_via = validate_town_in_country(country, town_raw)
-        if is_valid and matched_via in {"exact", "alternate"} and not is_town_literally_a_suburb:
+        if is_valid and matched_via and not is_town_literally_a_suburb:
             warnings.append(f"pass1_town_confirmed_geonames:{matched_via}")
             if has_suburb_context:
                 warnings.append("pass1_town_extracted_from_suburb_and_confirmed")
+            
+            # ✅ CORRECTION: Nettoyage des alertes de blocage précédentes si on a récupéré une ville (ex: Post-SLM ou Post-Fragment)
+            warnings[:] = [w for w in warnings if "requires_manual_verification" not in str(w)]
             
             # ✅ CORRECTION: Conserver la localité exacte (ex: Douar Hicher) au lieu de promouvoir!
             parent_town = resolve_locality_hierarchy(country, town_raw)
@@ -80,9 +108,14 @@ def _validate_pass1_country_town(party: CanonicalParty) -> Tuple[str, str, bool,
                 warnings.append(f"pass1_locality_has_parent:{canonical}→{parent_town}")
                 return country, canonical.upper(), True, False
             
-            return country, town_raw.upper(), True, False
+            return country, canonical.upper(), True, False
         else:
             warnings.append(f"pass1_town_not_official:{town_raw}")
+            inferred_town = _infer_town_from_address_lines(country, party.address_lines or [])
+            if inferred_town:
+                warnings.append(f"pass1_town_inferred_from_address:{inferred_town}")
+                warnings[:] = [w for w in warnings if "requires_manual_verification" not in str(w)]
+                return country, inferred_town.upper(), True, False
             if is_town_literally_a_suburb:
                 warnings.append("pass1_town_is_suburb_keyword_rejected")
                 warnings.append("requires_manual_verification:suburb_cannot_be_promoted_to_city")
