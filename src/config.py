@@ -25,6 +25,7 @@ ORG_HINTS = {
 NOISE_PREFIXES = {
     "TEL", "TEL:", "FAX", "FAX:", "PHONE", "PHONE:", "MOBILE", "MOBILE:",
     "REF", "REF:", "REFERENCE", "BIC", "BIC:",
+    "ATTN", "ATTN:", "C/O", "C/O:", "A L ATTENTION DE",
 }
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://172.31.96.1:11434")

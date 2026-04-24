@@ -9,6 +9,30 @@ from src.pipeline_logger import PipelineLogger
 from src.rejection_policy import apply_rejection_policy
 
 
+def _select_best_geo_fragment(party):
+    fragments = list(getattr(party, "fragmented_addresses", []) or [])
+    if not fragments:
+        return None
+
+    def _score(frag):
+        score = 0.0
+        if getattr(frag, "twn_nm", None):
+            score += 4.0
+        if getattr(frag, "pst_cd", None):
+            score += 3.0
+        if getattr(frag, "ctry_sub_div", None):
+            score += 1.0
+        if getattr(frag, "bldg_nb", None) or getattr(frag, "strt_nm", None):
+            score -= 1.5
+        score += float(getattr(frag, "fragmentation_confidence", 0.0) or 0.0)
+        return score
+
+    candidates = [frag for frag in fragments if getattr(frag, "twn_nm", None) or getattr(frag, "pst_cd", None)]
+    if not candidates:
+        return None
+    return max(candidates, key=_score)
+
+
 def _recalibrate_confidence_after_slm(party):
     """Remonte la confiance si le fallback SLM est confirmé par les validations aval."""
     if not getattr(party.meta, "fallback_used", False):
@@ -116,14 +140,14 @@ def run_pipeline(
     
     # --- BACKFILL depuis Fragmentation si E1 a échoué ---
     if getattr(e2, 'fragmented_addresses', []) and e2.country_town:
-        for frag in e2.fragmented_addresses:
-            if frag.fragmentation_confidence > 0.8:
-                if not e2.country_town.town and frag.twn_nm and str(frag.twn_nm).upper() not in ["AVENUE", "RUE", "BOULEVARD", "STREET", "ZONE INDUSTRIELLE"]:
-                    e2.country_town.town = frag.twn_nm
-                    e2.meta.warnings.append(f"pass2_town_backfilled_from_fragmentation:{frag.twn_nm}")
-                    e2.meta.parse_confidence = min(0.9, e2.meta.parse_confidence + 0.15)
-                if not e2.country_town.postal_code and frag.pst_cd:
-                    e2.country_town.postal_code = frag.pst_cd
+        geo_frag = _select_best_geo_fragment(e2)
+        if geo_frag and geo_frag.fragmentation_confidence > 0.8:
+            if not e2.country_town.town and geo_frag.twn_nm and str(geo_frag.twn_nm).upper() not in ["AVENUE", "RUE", "BOULEVARD", "STREET", "ZONE INDUSTRIELLE"]:
+                e2.country_town.town = geo_frag.twn_nm
+                e2.meta.warnings.append(f"pass2_town_backfilled_from_fragmentation:{geo_frag.twn_nm}")
+                e2.meta.parse_confidence = min(0.9, e2.meta.parse_confidence + 0.15)
+            if not e2.country_town.postal_code and geo_frag.pst_cd:
+                e2.country_town.postal_code = geo_frag.pst_cd
 
     logger.log(
         "E2.5", "Fragmentation terminée",
@@ -158,15 +182,15 @@ def run_pipeline(
         
         # --- BACKFILL depuis Fragmentation (Post-SLM) ---
         if getattr(e2, 'fragmented_addresses', []) and e2.country_town:
-            for frag in e2.fragmented_addresses:
-                if frag.fragmentation_confidence > 0.8:
-                    if not e2.country_town.town and frag.twn_nm and str(frag.twn_nm).upper() not in ["AVENUE", "RUE", "BOULEVARD", "STREET", "ZONE INDUSTRIELLE"]:
-                        e2.country_town.town = frag.twn_nm
-                        e2.meta.warnings.append(f"pass2_town_backfilled_from_fragmentation:{frag.twn_nm}")
-                        # ✅ CORRECTION: Épurer les marqueurs de quarantaine car on a récupéré une ville fiable post-SLM
-                        e2.meta.warnings[:] = [w for w in e2.meta.warnings if "requires_manual_verification" not in str(w)]
-                    if not e2.country_town.postal_code and frag.pst_cd:
-                        e2.country_town.postal_code = frag.pst_cd
+            geo_frag = _select_best_geo_fragment(e2)
+            if geo_frag and geo_frag.fragmentation_confidence > 0.8:
+                if not e2.country_town.town and geo_frag.twn_nm and str(geo_frag.twn_nm).upper() not in ["AVENUE", "RUE", "BOULEVARD", "STREET", "ZONE INDUSTRIELLE"]:
+                    e2.country_town.town = geo_frag.twn_nm
+                    e2.meta.warnings.append(f"pass2_town_backfilled_from_fragmentation:{geo_frag.twn_nm}")
+                    # ✅ CORRECTION: Épurer les marqueurs de quarantaine car on a récupéré une ville fiable post-SLM
+                    e2.meta.warnings[:] = [w for w in e2.meta.warnings if "requires_manual_verification" not in str(w)]
+                if not e2.country_town.postal_code and geo_frag.pst_cd:
+                    e2.country_town.postal_code = geo_frag.pst_cd
 
         e2 = _recalibrate_confidence_after_slm(e2)
 
@@ -176,7 +200,7 @@ def run_pipeline(
             warnings=e2.meta.warnings,
         )
 
-    # --- GEO-KNOWLEDGE : Résolution Postale Implicite ---
+    # --- GEO-KNOWLEDGE : Backfill prudent depuis le postal explicite uniquement ---
     def _enrich_city_via_postal(party):
         if not party.country_town: return party
         t = party.country_town.town
@@ -207,6 +231,15 @@ def run_pipeline(
             "SUKRAH": "2036", "LA SOUKRA": "2036", "SOUKRA": "2036"
         }
         
+        # Mapping inversé pour déduire le code postal depuis la ville
+        reverse_mapping_tn = {
+            "TUNIS": "1000", "ARIANA": "2080", "ARYANAH": "2080", "SFAX": "3000", "SOUSSE": "4000", 
+            "NABEUL": "8000", "MONTPLAISIR": "1073", "LES BERGES DU LAC": "1053", 
+            "BARDO": "2000", "LA MARSA": "2070", "MONASTIR": "5000", 
+            "GABES": "6000", "HAMMAM SOUSSE": "4011", "CARTHAGE": "2016",
+            "SUKRAH": "2036", "LA SOUKRA": "2036", "SOUKRA": "2036"
+        }
+        
         if c == "TN" and p:
             import re
             clean_p = re.sub(r"[^\d]", "", str(p))
@@ -216,44 +249,6 @@ def run_pipeline(
                     if not party.meta.warnings: party.meta.warnings = []
                     party.meta.warnings.append(f"geo_postal_resolution_{clean_p}")
                     t = party.country_town.town # Mise à jour locale
-                    
-        # NOUVEAU: Si on a la ville et le pays, mais pas le code postal, on le déduit
-        if c == "TN" and not p and t:
-            clean_t = str(t).upper().strip()
-            if clean_t in reverse_mapping_tn:
-                party.country_town.postal_code = reverse_mapping_tn[clean_t]
-                if not party.meta.warnings: party.meta.warnings = []
-                party.meta.warnings.append(f"geo_postal_inferred_from_town_{clean_t}")
-            else:
-                # 🧠 Tentative de déduction IA (Fallback SLM de seconde ligne) si absent du dictionnaire
-                import requests
-                from src.config import OLLAMA_BASE_URL
-                try:
-                    logger.log("E3(GEO)", "Fallback IA pour code postal manquant", town=clean_t)
-                    prompt = f"Tu es un postier en Tunisie. Pour la ville de '{clean_t}', quel est le principal code postal ? Ne dis absolument rien d'autre, réponds uniquement avec les 4 chiffres exacts sans espace."
-                    
-                    r = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json={
-                        "model": slm_model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"temperature": 0.0}
-                    }, timeout=4)
-                    
-                    if r.status_code == 200:
-                        ans = r.json().get("response", "").strip()
-                        # Extraire le premier bloc de 4 chiffres (Standard TN)
-                        import re
-                        match = re.search(r'\b\d{4}\b', ans)
-                        if match:
-                            inferred_code = match.group(0)
-                            party.country_town.postal_code = inferred_code
-                            if not party.meta.warnings: party.meta.warnings = []
-                            party.meta.warnings.append(f"pass3_geo_postal_inferred_via_slm:{inferred_code}")
-                            logger.log("E3(GEO)", f"SLM a déduit le code postal: {inferred_code}", town=clean_t)
-                        else:
-                            logger.log("E3(GEO)", "SLM n'a pas pu déduire le code postal", raw_answer=ans)
-                except Exception as e:
-                    logger.log("E3(GEO)", "Échec de l'appel SLM pour le code postal", error=str(e))
         
         # 🧹 CLEANUP FINAL AVANT RETOUR: Si la ville est connue, on vire TOUT 'requires_manual_verification:town_unverified'
         if party.country_town and party.country_town.town and str(party.country_town.town).strip().upper() not in ["", "N A", "N/A", "NULL", "NONE"]:

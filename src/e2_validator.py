@@ -65,6 +65,60 @@ def _infer_town_from_address_lines(country: str, address_lines: List[str]) -> Op
                 return city_n
     return None
 
+
+def _prefer_input_town_when_canonical_expands(town_raw: str, canonical: Optional[str]) -> str:
+    if not town_raw or not canonical:
+        return canonical or town_raw
+
+    raw_n = _norm(town_raw)
+    can_n = _norm(canonical)
+    if not raw_n or not can_n or raw_n == can_n:
+        return can_n or raw_n
+
+    raw_tokens = set(raw_n.split())
+    can_tokens = set(can_n.split())
+    if not raw_tokens or not can_tokens:
+        return can_n
+
+    # Keep the input form when canonical only adds directional qualifiers.
+    directional_tokens = {
+        "NORD", "SUD", "EST", "OUEST", "NORTH", "SOUTH", "EAST", "WEST",
+        "N", "S", "E", "W",
+    }
+    added_tokens = can_tokens - raw_tokens
+    if raw_tokens.issubset(can_tokens) and added_tokens and added_tokens.issubset(directional_tokens):
+        return raw_n
+
+    return can_n
+
+
+def _looks_like_local_script_town(country: str, town: str) -> bool:
+    if not country or not town:
+        return False
+    country = _norm(country)
+    town = _norm(town)
+    cjk_countries = {"CN", "JP", "KR", "TW", "HK"}
+    arabic_script_countries = {"MA", "DZ", "TN", "EG", "SA", "AE", "QA", "KW", "BH", "OM", "JO", "LB", "SY", "IQ", "YE", "LY", "SD", "PS"}
+    cyrillic_countries = {"RU", "UA", "BY", "BG", "RS", "MK", "ME", "KZ", "KG", "TJ", "UZ", "MN"}
+    devanagari_countries = {"IN", "NP"}
+
+    if country not in (cjk_countries | arabic_script_countries | cyrillic_countries | devanagari_countries):
+        return False
+    if re.search(r"\d", town):
+        return False
+
+    script_patterns = []
+    if country in cjk_countries:
+        script_patterns.append(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+    if country in arabic_script_countries:
+        script_patterns.append(r"[\u0600-\u06FF]")
+    if country in cyrillic_countries:
+        script_patterns.append(r"[\u0400-\u04FF]")
+    if country in devanagari_countries:
+        script_patterns.append(r"[\u0900-\u097F]")
+
+    return any(bool(re.search(pattern, town)) for pattern in script_patterns)
+
 # ============================================================
 # PASS 1 — Validation géographique country/town
 # ============================================================
@@ -94,6 +148,7 @@ def _validate_pass1_country_town(party: CanonicalParty) -> Tuple[str, str, bool,
     if GEONAMES_AVAILABLE and country and town_raw:
         is_valid, canonical, matched_via = validate_town_in_country(country, town_raw)
         if is_valid and matched_via and not is_town_literally_a_suburb:
+            chosen_town = _prefer_input_town_when_canonical_expands(town_raw, canonical)
             warnings.append(f"pass1_town_confirmed_geonames:{matched_via}")
             if has_suburb_context:
                 warnings.append("pass1_town_extracted_from_suburb_and_confirmed")
@@ -103,14 +158,18 @@ def _validate_pass1_country_town(party: CanonicalParty) -> Tuple[str, str, bool,
             
             # ✅ CORRECTION: Conserver la localité exacte (ex: Douar Hicher) au lieu de promouvoir!
             parent_town = resolve_locality_hierarchy(country, town_raw)
-            if parent_town and parent_town.upper() != canonical.upper():
+            if parent_town and parent_town.upper() != _norm(chosen_town):
                 # C'est une localité avec un parent administratif, mais on garde la localité précise
-                warnings.append(f"pass1_locality_has_parent:{canonical}→{parent_town}")
-                return country, canonical.upper(), True, False
+                warnings.append(f"pass1_locality_has_parent:{chosen_town}→{parent_town}")
+                return country, _norm(chosen_town), True, False
             
-            return country, canonical.upper(), True, False
+            return country, _norm(chosen_town), True, False
         else:
             warnings.append(f"pass1_town_not_official:{town_raw}")
+            if _looks_like_local_script_town(country, town_raw):
+                warnings.append("pass1_town_local_script_accepted")
+                warnings[:] = [w for w in warnings if "requires_manual_verification" not in str(w)]
+                return country, town_raw, True, False
             inferred_town = _infer_town_from_address_lines(country, party.address_lines or [])
             if inferred_town:
                 warnings.append(f"pass1_town_inferred_from_address:{inferred_town}")

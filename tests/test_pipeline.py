@@ -154,3 +154,104 @@ def test_fragmentation_moves_immeuble_to_building_name(monkeypatch):
     assert best_frag.strt_nm == "RUE MOHAMED ALI"
     assert best_frag.bldg_nb is None
     assert best_frag.bldg_nm == "IMMEUBLE"
+
+
+def test_pipeline_prefers_city_postcode_fragment_for_town(monkeypatch):
+    monkeypatch.setattr("src.pipeline.needs_slm_fallback", lambda party: False)
+    raw = """:59:/GB29NWBK60161331926819
+ACME Corporation Ltd
+45 Canary Wharf
+London E14 5AB
+United Kingdom
+"""
+    result, _ = run_pipeline(raw, message_id="TEST_PIPE_GB_LOCALITY")
+    assert result.meta.rejected is False
+    assert result.country_town.country == "GB"
+    assert result.country_town.town == "LONDON"
+    assert result.country_town.postal_code == "E14 5AB"
+
+
+def test_pipeline_does_not_infer_postal_code_from_town_and_country(monkeypatch):
+    monkeypatch.setattr("src.pipeline.needs_slm_fallback", lambda party: False)
+    raw = """:59:/TN5914700002202576951487
+SOCIETE TEST
+RUE DE LA REPUBLIQUE
+SOUSSE
+TUNISIE
+"""
+    result, _ = run_pipeline(raw, message_id="TEST_PIPE_NO_POSTAL_INFERENCE")
+
+    assert result.country_town.country == "TN"
+    assert result.country_town.town == "SOUSSE"
+    assert result.country_town.postal_code is None
+    assert not any("geo_postal_inferred_from_town_" in str(w) for w in result.meta.warnings)
+
+
+def test_pipeline_cn_postal_marker_does_not_become_town(monkeypatch):
+    monkeypatch.setattr("src.pipeline.needs_slm_fallback", lambda party: False)
+    raw = """:50K:/CN12345678901234567890
+北京国际贸易有限公司
+北京市朝阳区建国门外大街1号
+国贸中心A座15层
+邮编:100004
+"""
+
+    result, _ = run_pipeline(raw, message_id="TEST_PIPE_CN")
+
+    assert result.country_town is not None
+    assert result.country_town.country == "CN"
+    assert result.country_town.postal_code == "100004"
+    assert result.country_town.town is not None
+    assert "邮编" not in (result.country_town.town or "")
+    assert result.meta.rejected is False
+
+
+def test_pipeline_keeps_input_town_without_directional_expansion(monkeypatch):
+    monkeypatch.setattr("src.pipeline.needs_slm_fallback", lambda party: False)
+    raw = """:50F:/TN5908024011072001462917
+1/Mr BEN DJEMAA YASSINE
+2/ BP N 4 WED RMAL SFAX
+3/TN/OUED REMEL
+"""
+
+    result, _ = run_pipeline(raw, message_id="TEST_PIPE_TN_OUED_REMEL")
+
+    assert result.country_town is not None
+    assert result.country_town.country == "TN"
+    assert result.country_town.town == "OUED REMEL"
+
+
+def test_pipeline_jp_postal_marker_does_not_become_town(monkeypatch):
+    monkeypatch.setattr("src.pipeline.needs_slm_fallback", lambda party: False)
+    raw = """:50K:/JP12345678901234567890
+株式会社サンプル
+東京都千代田区
+丸の内1-1-1
+〒100-0005
+"""
+
+    result, _ = run_pipeline(raw, message_id="TEST_PIPE_JP")
+
+    assert result.country_town is not None
+    assert result.country_town.country == "JP"
+    assert result.country_town.postal_code == "100-0005"
+    assert result.country_town.town is not None
+    assert "〒" not in (result.country_town.town or "")
+    assert result.meta.rejected is False
+
+
+def test_pipeline_ar_postal_marker_does_not_become_town(monkeypatch):
+    monkeypatch.setattr("src.pipeline.needs_slm_fallback", lambda party: False)
+    raw = """:50K:/MA12345678901234567890
+شركة الاختبار الدولية
+الدار البيضاء
+الرمز البريدي: 20000
+"""
+
+    result, _ = run_pipeline(raw, message_id="TEST_PIPE_AR")
+
+    assert result.country_town is not None
+    assert result.country_town.country == "MA"
+    assert result.country_town.postal_code == "20000"
+    assert result.country_town.town is not None
+    assert "الرمز" not in (result.country_town.town or "")

@@ -11,7 +11,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# FORCE_RELOAD_TRIGGER_1
+# FORCE_RELOAD_TRIGGER_3
 import sys
 for m in list(sys.modules.keys()):
     if m.startswith("src."):
@@ -20,6 +20,7 @@ for m in list(sys.modules.keys()):
 from src.pipeline import run_pipeline
 from src.pipeline_logger import PipelineLogger
 from src.iso20022_mapper import build_iso20022_party_xml
+from src.quality_metrics import compute_reliability_score
 
 # ─────────────────────────────────────────────
 # CONFIG PAGE
@@ -235,6 +236,7 @@ if page == "Mode Avancé (Démo Initiale)":
                 slm_model="qwen2.5:0.5b",
                 logger=live_logger
             )
+            reliability = compute_reliability_score(result)
             
             elapsed = round(time.time() - start_time, 2)
             
@@ -262,6 +264,7 @@ if page == "Mode Avancé (Démo Initiale)":
                 <hr>
                 <div class="result-field"><span class="result-label">Voie utilisée :</span> {"🧠 IA Générative (Fallback)" if getattr(result.meta, 'fallback_used', False) else "⚙️ Algorithmique (Heuristique)"}</div>
                 <div class="result-field"><span class="result-label">Confiance :</span> {int((result.meta.parse_confidence or 0)*100)}%</div>
+                <div class="result-field"><span class="result-label">Fiabilité Pipeline :</span> {reliability['percent']}% ({reliability['band']})</div>
             </div>
             """
             result_container.markdown(res_html, unsafe_allow_html=True)
@@ -286,6 +289,9 @@ if page == "Mode Avancé (Démo Initiale)":
                     
             with t2:
                 st.write(f"**Confiance Parse :** {result.meta.parse_confidence}")
+                st.write(f"**Fiabilité Pipeline :** {reliability['score']} ({reliability['band']})")
+                st.write("**Composants fiabilité :**", reliability["components"])
+                st.write("**Justifications :**", reliability["reasons"])
                 st.write(f"**Message Rejeté :** {result.meta.rejected}")
                 st.write("**Raisons de Rejet :**", result.meta.rejection_reasons)
                 st.write("**Warnings Générés :**", result.meta.warnings)
@@ -340,6 +346,7 @@ elif page == "Mode Démo Simple (Validation)":
                 def log(self, *args, **kwargs): pass
             with st.spinner("Extraction en cours..."):
                 result, _ = run_pipeline(raw_message=raw_message, message_id="DEMO", logger=SilentLogger())
+                reliability = compute_reliability_score(result)
                 iso_xml, iso_payload, iso_errors = build_iso20022_party_xml(result, include_envelope=True)
                 # Construct clean dictionary
                 clean_json = {
@@ -390,6 +397,8 @@ elif page == "Mode Démo Simple (Validation)":
                 else:
                     st.toast("✅ MESSAGE ACCEPTÉ", icon="✅")
                     st.success(f"✅ Extraction Terminée avec {int((result.meta.parse_confidence or 0)*100)}% de confiance")
+
+                st.info(f"Fiabilité pipeline estimée: {reliability['percent']}% ({reliability['band']})")
                     
                 st.json(clean_json)
                 st.markdown("### 🧩 Mapping ISO 20022")

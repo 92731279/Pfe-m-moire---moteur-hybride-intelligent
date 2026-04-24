@@ -9,6 +9,9 @@ from xml.etree.ElementTree import Element, SubElement, tostring
 
 from src.models import CanonicalParty, FragmentedAddress, PartyIdentifier
 
+PRIVATE_PARTY_ID_CODES = {"ARNU", "CCPT", "NIDN", "SOSE", "TXID"}
+ORGANISATION_PARTY_ID_CODES = {"CUST", "DRLC", "EMPL"}
+
 
 def _clean_text(value: Optional[str]) -> Optional[str]:
     if value is None:
@@ -41,6 +44,56 @@ def _best_fragment(party: CanonicalParty) -> Optional[FragmentedAddress]:
     return max(fragments, key=lambda frag: getattr(frag, "fragmentation_confidence", 0.0) or 0.0)
 
 
+def _best_street_fragment(party: CanonicalParty) -> Optional[FragmentedAddress]:
+    fragments = list(getattr(party, "fragmented_addresses", []) or [])
+    if not fragments:
+        return None
+
+    candidates = [frag for frag in fragments if getattr(frag, "strt_nm", None) or getattr(frag, "bldg_nb", None) or getattr(frag, "bldg_nm", None) or getattr(frag, "room", None)]
+    if not candidates:
+        return None
+
+    def _score(frag: FragmentedAddress) -> float:
+        score = 0.0
+        if getattr(frag, "strt_nm", None):
+            score += 4.0
+        if getattr(frag, "bldg_nb", None):
+            score += 2.0
+        if getattr(frag, "bldg_nm", None):
+            score += 1.5
+        if getattr(frag, "room", None):
+            score += 1.0
+        score += float(getattr(frag, "fragmentation_confidence", 0.0) or 0.0)
+        return score
+
+    return max(candidates, key=_score)
+
+
+def _best_geo_fragment(party: CanonicalParty) -> Optional[FragmentedAddress]:
+    fragments = list(getattr(party, "fragmented_addresses", []) or [])
+    if not fragments:
+        return None
+
+    candidates = [frag for frag in fragments if getattr(frag, "twn_nm", None) or getattr(frag, "pst_cd", None)]
+    if not candidates:
+        return None
+
+    def _score(frag: FragmentedAddress) -> float:
+        score = 0.0
+        if getattr(frag, "twn_nm", None):
+            score += 4.0
+        if getattr(frag, "pst_cd", None):
+            score += 3.0
+        if getattr(frag, "ctry_sub_div", None):
+            score += 1.0
+        if getattr(frag, "strt_nm", None):
+            score -= 1.0
+        score += float(getattr(frag, "fragmentation_confidence", 0.0) or 0.0)
+        return score
+
+    return max(candidates, key=_score)
+
+
 def _detect_post_box(lines: List[str]) -> Optional[str]:
     for line in lines or []:
         upper = line.upper()
@@ -69,6 +122,101 @@ def _extract_original_structured_town(party: CanonicalParty) -> Optional[str]:
     return None
 
 
+def _extract_structured_line3_details(party: CanonicalParty) -> Dict[str, Optional[str]]:
+    details: Dict[str, Optional[str]] = {
+        "country": None,
+        "locality_raw": None,
+        "town_candidate": None,
+        "postal_candidate": None,
+        "sub_div_candidate": None,
+    }
+
+    raw = getattr(party, "raw", None)
+    if not raw:
+        return details
+
+    for line in str(raw).splitlines():
+        normalized = _clean_text(line)
+        if not normalized or not normalized.startswith("3/"):
+            continue
+
+        parts = [part.strip() for part in normalized.split("/", 2)]
+        if len(parts) < 3:
+            continue
+
+        country = _clean_text(parts[1])
+        locality = _clean_text(parts[2])
+        if not locality:
+            continue
+
+        details["country"] = country
+        details["locality_raw"] = locality
+
+        candidate = locality
+        postal_candidate = None
+        sub_div_candidate = None
+
+        # Works for ZIP, alphanumeric postcodes, and spaced formats (e.g. M5H 2N2).
+        postal_patterns = [
+            r"\b(\d{5}(?:-\d{4})?)$",  # US ZIP / ZIP+4
+            r"\b([ABCEGHJ-NPRSTVXY]\d[ABCEGHJ-NPRSTV-Z][ -]?\d[ABCEGHJ-NPRSTV-Z]\d)$",  # Canada
+            r"\b([A-Z0-9]{3,10})$",  # Generic compact postal
+        ]
+        for pattern in postal_patterns:
+            m_postal = re.search(pattern, candidate.upper())
+            if not m_postal:
+                continue
+            extracted = _clean_text(m_postal.group(1))
+            if not extracted or not re.search(r"\d", extracted):
+                continue
+            postal_candidate = extracted
+            candidate = candidate[:m_postal.start()].rstrip(" ,-")
+            break
+
+        m_sub = re.search(r"^(.*?)(?:,\s*|\s+)([A-Z]{2,3})$", candidate.upper())
+        if m_sub and len((m_sub.group(1) or "").split()) >= 1:
+            sub_div_candidate = _clean_text(m_sub.group(2))
+            candidate = candidate[:len(m_sub.group(1))].rstrip(" ,-")
+
+        details["town_candidate"] = _clean_text(candidate)
+        details["postal_candidate"] = postal_candidate
+        details["sub_div_candidate"] = sub_div_candidate
+        return details
+
+    return details
+
+
+def _is_redundant_locality(locality: Optional[str], town: Optional[str], sub_div: Optional[str], postal: Optional[str]) -> bool:
+    if not locality or not town:
+        return False
+
+    locality_n = _cmp_norm(locality)
+    town_n = _cmp_norm(town)
+    sub_div_n = _cmp_norm(sub_div)
+    postal_n = _cmp_norm(postal)
+
+    if locality_n == town_n:
+        return True
+
+    tokens = set(locality_n.split())
+    if not town_n or not set(town_n.split()).issubset(tokens):
+        return False
+
+    if sub_div_n and set(sub_div_n.split()).issubset(tokens):
+        pass
+    elif sub_div_n:
+        return False
+
+    if postal_n and set(postal_n.split()).issubset(tokens):
+        pass
+    elif postal_n:
+        return False
+
+    # If locality only repeats already-mapped components (town/subdivision/postal), skip it.
+    composite = " ".join(part for part in [town_n, sub_div_n, postal_n] if part).strip()
+    return bool(composite and locality_n == composite)
+
+
 def _scheme_name_from_identifier(identifier: Optional[PartyIdentifier], default_code: str = "CUST") -> Optional[Dict[str, str]]:
     if not identifier:
         return {"Cd": default_code}
@@ -92,24 +240,45 @@ def _build_other_block(identifier: Optional[str], scheme_code: Optional[str], is
 
 def _build_postal_address(party: CanonicalParty) -> Dict[str, Any]:
     fragment = _best_fragment(party)
+    street_fragment = _best_street_fragment(party) or fragment
+    geo_fragment = _best_geo_fragment(party) or fragment
     geo = party.country_town
     address_lines = _clean_list(party.address_lines)
     postal_complement = _clean_text(getattr(party, "postal_complement", None))
     original_town = _extract_original_structured_town(party)
-    canonical_town = _clean_text(getattr(fragment, "twn_nm", None) or (geo.town if geo else None))
+    line3_details = _extract_structured_line3_details(party)
+    canonical_town = _clean_text(getattr(geo_fragment, "twn_nm", None) or (geo.town if geo else None))
 
     if postal_complement and postal_complement not in address_lines:
         address_lines.append(postal_complement)
 
-    strt_nm = _clean_text(getattr(fragment, "strt_nm", None))
-    bldg_nb = _clean_text(getattr(fragment, "bldg_nb", None))
-    bldg_nm = _clean_text(getattr(fragment, "bldg_nm", None))
-    flr = _clean_text(getattr(fragment, "flr", None))
+    strt_nm = _clean_text(getattr(street_fragment, "strt_nm", None))
+    bldg_nb = _clean_text(getattr(street_fragment, "bldg_nb", None))
+    bldg_nm = _clean_text(getattr(street_fragment, "bldg_nm", None))
+    flr = _clean_text(getattr(street_fragment, "flr", None))
     pst_bx = postal_complement or _detect_post_box(address_lines)
-    room = _clean_text(getattr(fragment, "room", None))
-    pst_cd = _clean_text(getattr(fragment, "pst_cd", None) or (geo.postal_code if geo else None))
-    ctry_sub_div = _clean_text(getattr(fragment, "ctry_sub_div", None))
-    ctry = _clean_text(getattr(fragment, "ctry", None) or (geo.country if geo else None))
+    room = _clean_text(getattr(street_fragment, "room", None))
+    pst_cd = _clean_text(
+        getattr(geo_fragment, "pst_cd", None)
+        or (geo.postal_code if geo else None)
+        or line3_details.get("postal_candidate")
+    )
+    ctry_sub_div = _clean_text(
+        getattr(geo_fragment, "ctry_sub_div", None)
+        or getattr(street_fragment, "ctry_sub_div", None)
+        or line3_details.get("sub_div_candidate")
+    )
+    ctry = _clean_text(getattr(geo_fragment, "ctry", None) or getattr(street_fragment, "ctry", None) or (geo.country if geo else None))
+
+    locality_fragment = None
+    for candidate in getattr(party, "fragmented_addresses", []) or []:
+        cand_town = _clean_text(getattr(candidate, "twn_nm", None))
+        if not cand_town or not canonical_town:
+            continue
+        if _cmp_norm(cand_town) == _cmp_norm(canonical_town):
+            continue
+        locality_fragment = cand_town
+        break
 
     redundant_lines: set[str] = set()
     for value in [strt_nm, bldg_nm, flr, pst_bx, room, pst_cd, canonical_town, original_town, ctry_sub_div, ctry]:
@@ -124,6 +293,9 @@ def _build_postal_address(party: CanonicalParty) -> Dict[str, Any]:
         _clean_text(" ".join(part for part in [strt_nm, bldg_nb, room] if part)),
         _clean_text(" ".join(part for part in [strt_nm, bldg_nm] if part)),
         _clean_text(" ".join(part for part in [strt_nm, bldg_nb, bldg_nm] if part)),
+        _clean_text(" ".join(part for part in [canonical_town, ctry_sub_div, pst_cd] if part)),
+        _clean_text(" ".join(part for part in [canonical_town, pst_cd] if part)),
+        _clean_text(" ".join(part for part in [ctry_sub_div, pst_cd] if part)),
     ]
     structured_variants = [variant for variant in structured_variants if variant]
     for variant in structured_variants:
@@ -135,6 +307,17 @@ def _build_postal_address(party: CanonicalParty) -> Dict[str, Any]:
         if line_norm in redundant_lines:
             continue
         filtered_address_lines.append(line)
+
+    inferred_locality = (
+        locality_fragment
+        or (
+            _clean_text(line3_details.get("locality_raw"))
+            if line3_details.get("locality_raw") and canonical_town
+            else _clean_text(original_town)
+        )
+    )
+    if _is_redundant_locality(inferred_locality, canonical_town, ctry_sub_div, pst_cd):
+        inferred_locality = None
 
     postal_address: Dict[str, Any] = {
         "AdrTp": None,
@@ -148,11 +331,7 @@ def _build_postal_address(party: CanonicalParty) -> Dict[str, Any]:
         "Room": room,
         "PstCd": pst_cd,
         "TwnNm": canonical_town,
-        "TwnLctnNm": (
-            _clean_text(original_town)
-            if original_town and canonical_town and _cmp_norm(original_town) != _cmp_norm(canonical_town)
-            else None
-        ),
+        "TwnLctnNm": inferred_locality,
         "DstrctNm": None,
         "CtrySubDvsn": ctry_sub_div,
         "Ctry": ctry,
@@ -163,7 +342,9 @@ def _build_postal_address(party: CanonicalParty) -> Dict[str, Any]:
 
 
 def _build_organisation_identification(party: CanonicalParty) -> Optional[Dict[str, Any]]:
-    candidates = [party.org_id, party.party_id]
+    candidates = [party.org_id]
+    if party.is_org is True and party.party_id and getattr(party.party_id, "code", None) in ORGANISATION_PARTY_ID_CODES:
+        candidates.append(party.party_id)
     other_entries: List[Dict[str, Any]] = []
 
     for candidate in candidates:
@@ -191,12 +372,16 @@ def _build_private_identification(party: CanonicalParty) -> Optional[Dict[str, A
             getattr(party.party_id, "code", None) or "NIDN",
             getattr(party.party_id, "issuer", None) or getattr(party.party_id, "country", None),
         ),
-        (
-            getattr(party.party_id, "identifier", None),
-            getattr(party.party_id, "code", None),
-            getattr(party.party_id, "issuer", None) or getattr(party.party_id, "country", None),
-        ),
     ]
+    party_id_code = getattr(party.party_id, "code", None)
+    if party.party_id and (party.is_org is not True or party_id_code in PRIVATE_PARTY_ID_CODES):
+        private_candidates.append(
+            (
+                getattr(party.party_id, "identifier", None),
+                getattr(party.party_id, "code", None),
+                getattr(party.party_id, "issuer", None) or getattr(party.party_id, "country", None),
+            )
+        )
     for identifier, scheme_code, issuer in private_candidates:
         block = _build_other_block(identifier, scheme_code, issuer)
         if block and block not in other_entries:

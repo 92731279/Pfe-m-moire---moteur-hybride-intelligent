@@ -130,6 +130,34 @@ def _name_just_appends_same_country(current_name: str, slm_name: str, country_co
     return resolve_country_code(suffix) == country_code
 
 
+def _can_overwrite_country_with_slm(party: CanonicalParty, slm_country: str) -> bool:
+    current_country = party.country_town.country if party.country_town else None
+    if not current_country:
+        return True
+
+    current_country = str(current_country).upper().strip()
+    slm_country = str(slm_country).upper().strip()
+    if current_country == slm_country:
+        return False
+
+    warnings = [str(w) for w in (_meta_get(party.meta, "warnings", []) or [])]
+    country_gap_tokens = ("country_missing", "country_not_found", "pass1_country_missing")
+    if any(any(token in w for token in country_gap_tokens) for w in warnings):
+        return True
+
+    account_country = None
+    if party.account:
+        m = re.match(r"^/([A-Z]{2})", str(party.account).upper().strip())
+        if m:
+            account_country = m.group(1)
+
+    if account_country and current_country == account_country and slm_country != account_country:
+        return False
+
+    # Conservative default: keep structured country when already present.
+    return False
+
+
 def _restore_unit_identifier(address_line: str, raw_source: Optional[str]) -> str:
     """Restaure un identifiant d'unité (ex: APPT 4B) perdu par le SLM si le brut le contient."""
     if not address_line or not raw_source:
@@ -413,6 +441,10 @@ class E3SLMFallback:
         VERSION 2: EXEMPLES D'ABORD pour éviter confusion SLM petit modèle.
         """
         raw = party.raw or ""
+        # 🔥 Ne JAMAIS envoyer le numéro de compte au SLM (risque élevé de confusion avec un code postal)
+        if party.account:
+            raw = raw.replace(party.account, "").strip()
+            
         field_type = party.field_type
         
         # Format strict: EXEMPLES D'ABORD, puis vraies données à la fin
@@ -550,11 +582,12 @@ Output:"""
             slm_name = slm_result['name']
             current_country = party.country_town.country if party.country_town else None
             
-            # Prendre prioritairement le nom du SLM si c'est un format 50K bruités
-            if party.field_type == "50K":
+            # Prendre prioritairement le nom du SLM si c'est un format 50K bruités ou si E1 a fusionné par erreur
+            warnings_list = [str(w) for w in party.meta.warnings]
+            if party.field_type == "50K" or "town_missing_from_name_country_pattern" in warnings_list:
                 party.name = [slm_name]
                 updated = True
-                logger.debug(f"[E3] Nom forcé en 50K : {slm_name}")
+                logger.debug(f"[E3] Nom forcé par l'IA en raison du contexte : {slm_name}")
             elif _name_just_appends_same_country(current_name, slm_name, current_country):
                 pass
             elif current_name == "UNKNOWN" or len(slm_name) >= len(current_name) - 3 or not current_name:
@@ -602,9 +635,12 @@ Output:"""
                 updated = True
                 logger.debug(f"[E3] Pays ajouté: {slm_result['country']}")
             elif party.country_town.country != slm_result['country']:
-                party.country_town.country = slm_result['country']
-                updated = True
-                logger.debug(f"[E3] Pays mis à jour: {slm_result['country']}")
+                if _can_overwrite_country_with_slm(party, slm_result['country']):
+                    party.country_town.country = slm_result['country']
+                    updated = True
+                    logger.debug(f"[E3] Pays mis à jour: {slm_result['country']}")
+                else:
+                    logger.debug(f"[E3] Pays conservé (source structurée): {party.country_town.country}")
         
         # 4. Ville (priorité si manquante ou contient adresse)
         if slm_result.get('town'):
@@ -637,7 +673,13 @@ Output:"""
         if updated:
             # Augmenter légèrement la confiance si SLM a amélioré
             current_confidence = _meta_get(party.meta, 'parse_confidence', 0.5)
-            _meta_set(party.meta, 'parse_confidence', min(0.85, current_confidence + 0.15))
+            # 🚀 NOUVEAU: Boost massif si le SLM a reconstruit un message totalement cassé !
+            if current_confidence <= 0.3 and party.name and party.country_town and party.country_town.town:
+                new_conf = 0.85
+            else:
+                new_conf = min(0.85, current_confidence + 0.15)
+                
+            _meta_set(party.meta, 'parse_confidence', new_conf)
             # Nettoyer les warnings résolus
             _meta_set(party.meta, 'warnings', self._clean_resolved_warnings(party))
         

@@ -178,6 +178,62 @@ def _parse_party_identifier(raw):
     elif len(parts) >= 3: identifier = parts[-1]
     return PartyIdentifier(code=code, country=country, issuer=issuer, identifier=identifier)
 
+
+def _normalize_line_8_value(value):
+    if value is None:
+        return ""
+    return " ".join(str(value).split())
+
+
+def _append_continuation_value(base_value, continuation_value):
+    base_value = base_value or ""
+    continuation_value = continuation_value or ""
+    if base_value.endswith("/") and continuation_value.startswith("/"):
+        continuation_value = continuation_value[1:]
+    elif base_value.endswith("-") and continuation_value.startswith("-"):
+        continuation_value = continuation_value[1:]
+    return f"{base_value}{continuation_value}"
+
+
+def _looks_like_identifier_continuation(value):
+    if not value:
+        return False
+    if " " in value:
+        return False
+    return bool(re.fullmatch(r"[A-Z0-9][A-Z0-9/._-]*", value.upper()))
+
+
+def _apply_structured_f_continuation(res, continuation_value, last_identifier_tag, warnings):
+    value = _normalize_line_8_value(continuation_value)
+    if len(value) > 35:
+        warnings.append("line_8_length_exceeds_35")
+
+    can_attach = (
+        (last_identifier_tag == "party_id" and res.party_id)
+        or (last_identifier_tag == "6" and res.org_id)
+        or (last_identifier_tag == "7" and res.national_id)
+    )
+    if not can_attach:
+        warnings.append("orphan_continuation_line")
+        warnings.append("T56_invalid_8_continuation")
+        return False
+
+    if not _looks_like_identifier_continuation(value):
+        warnings.append("line_8_non_identifier_narrative")
+        warnings.append("T56_invalid_8_semantic_content")
+        return False
+
+    if last_identifier_tag == "party_id" and res.party_id:
+        res.party_id.identifier = _append_continuation_value(res.party_id.identifier, value)
+        return True
+    if last_identifier_tag == "6" and res.org_id:
+        res.org_id.identifier = _append_continuation_value(res.org_id.identifier, value)
+        return True
+    if last_identifier_tag == "7" and res.national_id:
+        res.national_id = _append_continuation_value(res.national_id, value)
+        return True
+    return False
+
 def _split_embedded_country_prefix(line):
     """
     Détecte un code pays collé au début d'une ligne (ex: "TNELHAOUARIA" → "TN", "ELHAOUARIA").
@@ -214,7 +270,7 @@ def _split_embedded_country_prefix(line):
         "ROM", "ROT", "SAN", "SEO", "SEV", "SKO", "SOF", "STO", "SYD",
         "TAI", "TAS", "TAL", "TEH", "THE", "TIR", "TUN", "ULA", "VAL", "VAN",
         "VIE", "VIL", "WAR", "WAS", "YAO", "YER", "ZAG", 
-        "TNO", "TNI", "TNE", # Eviter de splitter TNO/TNI si ca design un lieu local
+        "TNO", "TNI", "TNE","ATT", "ATTN", "ATTA", # Eviter de splitter TNO/TNI si ca design un lieu local
     )
     
     # Garde 3: Si la ligne commence par un mot protégé → pas un pays collé
@@ -288,6 +344,14 @@ def _parse_structured_country_town(value):
         if m and re.search(r"\d", m.group(2)):
             town = m.group(1).strip(",")
             postal_code = m.group(2).strip()
+
+    # Structured lines like "US/SAN FRANCISCO, CA 94103" include a US state code
+    # in the town segment. Keep the city name and move only the postal code.
+    if postal_code and country in {"US", "CA"}:
+        m_state = re.match(r"^(.*?)(?:,\s*|\s+)([A-Z]{2})$", town.strip())
+        if m_state and len(m_state.group(1).split()) >= 2:
+            town = m_state.group(1).strip(" ,")
+
     town = _clean_town_value(town)
     return CountryTown(country=country, town=town or None, postal_code=postal_code), True
 
@@ -302,6 +366,56 @@ def _parse_date_of_birth(value):
     if re.fullmatch(r"\d{8}", raw):
         return DateOfBirth(raw=raw, year=raw[:4], month=raw[4:6], day=raw[6:8])
     return DateOfBirth(raw=raw)
+
+
+POSTAL_MARKER_PATTERN = re.compile(
+    r"(?:^|\b)(?:POSTAL\s*CODE|POSTCODE|ZIP\s*CODE|ZIP|CODE\s*POSTAL|CP|PINCODE|PIN\s*CODE|PLZ|PSC|CEP|邮编|郵編|〒|우편번호|INDEX|ПОЧТОВЫЙ\s*ИНДЕКС|CODICE\s*POSTALE|CÓDIGO\s*POSTAL|CODIGO\s*POSTAL|CÓD\.\s*POSTAL|COD\.\s*POSTAL|الرمز\s*البريدي|رمز\s*بريدي)\s*[:：-]?\s*([A-Z0-9][A-Z0-9\- ]{2,12})\s*$",
+    re.IGNORECASE,
+)
+
+
+def _extract_postal_marker(line):
+    raw = _norm(line)
+    if not raw:
+        return None
+
+    m = POSTAL_MARKER_PATTERN.search(raw)
+    if m:
+        return _norm(m.group(1)).replace(" ", "")
+
+    # Postal isolated after a marker-like prefix, including scripts without spaces.
+    for prefix in ("邮编", "郵編", "〒", "우편번호", "ZIP", "POSTCODE", "POSTAL CODE", "CODE POSTAL", "CP", "PLZ", "CEP", "PINCODE", "INDEX", "ПОЧТОВЫЙ ИНДЕКС", "CODICE POSTALE", "CÓDIGO POSTAL", "CODIGO POSTAL", "الرمز البريدي", "رمز بريدي"):
+        if raw.upper().startswith(prefix.upper()):
+            tail = raw[len(prefix):].strip(" :：-\t")
+            if tail and re.fullmatch(r"[A-Z0-9][A-Z0-9\- ]{2,12}", tail, flags=re.IGNORECASE):
+                return tail.replace(" ", "")
+    return None
+
+
+def _looks_like_locality_line(value):
+    candidate = _norm(value)
+    if not candidate:
+        return False
+    if _contains_address_keyword(candidate):
+        return False
+    if resolve_country_code(candidate):
+        return False
+    if _is_known_city(candidate):
+        return True
+
+    # CJK locality markers (city/district/prefecture/province).
+    if re.search(r"[\u3040-\u30ff\u3400-\u9fff]", candidate):
+        return bool(re.search(r"(市|区|縣|县|州|省|郡|府|都|道|町|村)$", candidate))
+
+    # Cyrillic / Arabic / Devanagari locality-like short tails.
+    if re.search(r"[\u0400-\u04FF\u0600-\u06FF\u0900-\u097F]", candidate):
+        return len(candidate.split()) <= 4 and not re.search(r"\d", candidate)
+
+    # Latin fallback: city/state style (e.g. "SAN FRANCISCO, CA").
+    if re.match(r"^.+,\s*[A-Z]{2,3}$", candidate):
+        return True
+
+    return False
 
 def _parse_country_encoded_line(line):
     raw = _norm(line)
@@ -399,6 +513,22 @@ def _extract_geo_from_free_lines(lines, warnings):
     last = _norm(lines[-1])
     up = last.upper()
 
+    postal_marker = _extract_postal_marker(last)
+    if postal_marker:
+        consumed = 1
+        country = None
+        town = None
+        if len(lines) >= 2:
+            prev = _norm(lines[-2])
+            prev_code = resolve_country_code(prev)
+            if prev_code:
+                country = prev_code
+                consumed = 2
+            elif _looks_like_locality_line(prev):
+                town = _clean_town_value(prev)
+                consumed = 2
+        return CountryTown(country=country, town=town, postal_code=postal_marker), consumed
+
     # 1. Format JO/JORDANIE
     encoded = _parse_country_encoded_line(last)
     if encoded:
@@ -491,8 +621,14 @@ def parse_free_party_field(pre, field_type, role, message_id):
 
     # 1. Extraction du compte
     if lines and lines[0].startswith("/"):
-        res.account = lines[0]
-        idx = 1
+        # 🔥 FIX CHAOS: Le compte et le contenu peuvent être collés sur 1 seule ligne sans retour chariot !
+        parts = lines[0].split(" ", 1)
+        res.account = parts[0]
+        if len(parts) > 1:
+            lines[0] = parts[1].strip()  # Le reste de la ligne redevient du contenu !
+            # On ne fait pas idx = 1, on garde la ligne 0 !
+        else:
+            idx = 1
 
     content = [_norm(x) for x in lines[idx:] if _norm(x)]
     if not content:
@@ -700,17 +836,21 @@ def parse_structured_50F(pre, message_id="MSG"):
     if lines and lines[0].startswith("/"):
         res.account = lines[0]
         idx = 1
+    last_identifier_tag = None
     if idx < len(lines):
         first_non_account = lines[idx]
         prefix = first_non_account.split("/", 1)[0].upper() if "/" in first_non_account else ""
         if prefix in PARTY_ID_PREFIXES:
             res.party_id = _parse_party_identifier(first_non_account)
+            last_identifier_tag = "party_id"
             idx += 1
     has_4 = has_5 = seen_3 = False
+    seen_8 = False
     for line in lines[idx:]:
         if "/" not in line: continue
         tag, value = line.split("/", 1)
         tag = tag.strip()
+        raw_value = value
         value = _norm(value)
         if tag == "1": res.name.append(value)
         elif tag == "2": res.address_lines.append(value)
@@ -725,10 +865,17 @@ def parse_structured_50F(pre, message_id="MSG"):
         elif tag == "6":
             parts = [p.strip() for p in value.split("/")]
             if len(parts) >= 3: res.org_id = PartyIdentifier(code="CUST", country=parts[0].upper(), issuer=parts[1], identifier=parts[2])
+            last_identifier_tag = "6"
         elif tag == "7":
             parts = [p.strip() for p in value.split("/")]
             res.national_id = parts[1] if len(parts) >= 2 else value
-        elif tag == "8": res.postal_complement = value
+            last_identifier_tag = "7"
+        elif tag == "8":
+            if seen_8:
+                warnings.append("T56_invalid_8_repetition")
+                continue
+            seen_8 = True
+            _apply_structured_f_continuation(res, raw_value, last_identifier_tag, warnings)
     if not seen_3 and "invalid_structured_line_3" not in warnings: warnings.append("missing_mandatory_3")
     if has_4 != has_5: warnings.append("4_and_5_must_appear_together")
     if res.country_town: res.country_town = _apply_iban_and_capital_fallback(res.country_town, pre.meta.iban_country, warnings)
@@ -748,11 +895,21 @@ def parse_structured_59F(pre, message_id="MSG"):
     if lines and lines[0].startswith("/"):
         res.account = lines[0]
         idx = 1
+    last_identifier_tag = None
+    if idx < len(lines):
+        first_non_account = lines[idx]
+        prefix = first_non_account.split("/", 1)[0].upper() if "/" in first_non_account else ""
+        if prefix in PARTY_ID_PREFIXES:
+            res.party_id = _parse_party_identifier(first_non_account)
+            last_identifier_tag = "party_id"
+            idx += 1
     seen_3 = False
+    seen_8 = False
     for line in lines[idx:]:
         if "/" not in line: continue
         tag, value = line.split("/", 1)
         tag = tag.strip()
+        raw_value = value
         value = _norm(value)
         if tag == "1": res.name.append(value)
         elif tag == "2": res.address_lines.append(value)
@@ -764,6 +921,12 @@ def parse_structured_59F(pre, message_id="MSG"):
                     res.country_town = CountryTown(country=value.upper(), town=None, postal_code=None)
                     seen_3 = True
                 else: warnings.append("invalid_structured_line_3")
+        elif tag == "8":
+            if seen_8:
+                warnings.append("T56_invalid_8_repetition")
+                continue
+            seen_8 = True
+            _apply_structured_f_continuation(res, raw_value, last_identifier_tag, warnings)
     if not seen_3 and "invalid_structured_line_3" not in warnings: warnings.append("missing_mandatory_3")
     if res.country_town: res.country_town = _apply_iban_and_capital_fallback(res.country_town, pre.meta.iban_country, warnings)
     res.is_org = _detect_org(res.name)

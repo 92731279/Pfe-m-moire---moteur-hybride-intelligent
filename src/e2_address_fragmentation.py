@@ -7,6 +7,90 @@ from src.models import CanonicalParty, FragmentedAddress
 from src.e2_address_parser import parse_address_line
 from src.logger import StepLogger
 
+
+def _contains_cjk(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r"[\u4e00-\u9fff]", str(text)))
+
+
+def _extract_chinese_fragment(line: str, country_hint: Optional[str]) -> Optional[FragmentedAddress]:
+    raw = (line or "").strip()
+    if not raw or (country_hint and str(country_hint).upper() != "CN") and not _contains_cjk(raw):
+        return None
+
+    if not _contains_cjk(raw):
+        return None
+
+    postal = None
+    postal_match = re.search(r"(?:邮编|郵編|ZIP|POSTCODE|POSTAL\s*CODE|CODE\s*POSTAL)\s*[:：-]?\s*(\d{4,10})", raw, re.IGNORECASE)
+    if postal_match:
+        postal = postal_match.group(1)
+
+    city_match = re.match(
+        r"^(?P<city>[\u4e00-\u9fff]{2,10}?市)(?P<district>[\u4e00-\u9fff]{2,10}(?:区|县|旗))?(?P<rest>.*)$",
+        raw,
+    )
+    if not city_match:
+        city_match = re.match(
+            r"^(?P<district>[\u4e00-\u9fff]{2,10}(?:区|县|旗))(?P<rest>.*)$",
+            raw,
+        )
+
+    if not city_match:
+        if postal:
+            return FragmentedAddress(pst_cd=postal, ctry=country_hint, fragmentation_confidence=0.65, fallback_used=True)
+        return None
+
+    city = city_match.groupdict().get("city") or None
+    district = (city_match.groupdict().get("district") or None)
+    if district:
+        district = re.sub(r"\s+", "", district)
+    rest = (city_match.groupdict().get("rest") or "").strip(" ，,;：:·")
+
+    # Normalize city to a usable town. Keep the raw Chinese city name.
+    town = city or district
+    if town and town.endswith("市"):
+        town = town
+
+    strt_nm = None
+    bldg_nb = None
+    bldg_nm = None
+    flr = None
+    room = None
+
+    street_match = re.search(r"(.+?(?:路|街|道|巷|大街|大道|胡同|弄|里))\s*(\d+[号弄]?)(.*)$", rest)
+    if street_match:
+        strt_nm = street_match.group(1).strip()
+        bldg_nb = street_match.group(2).strip()
+        rest = (street_match.group(3) or "").strip()
+
+    floor_match = re.search(r"(\d+)\s*层", rest)
+    if floor_match:
+        flr = floor_match.group(1)
+
+    building_match = re.search(r"(.+?(?:座|栋|楼|中心|大厦))(?:(\d+)\s*层)?$", rest)
+    if building_match:
+        bldg_nm = building_match.group(1).strip()
+        if not flr and building_match.group(2):
+            flr = building_match.group(2)
+    elif rest:
+        bldg_nm = rest or None
+
+    return FragmentedAddress(
+        strt_nm=strt_nm,
+        bldg_nb=bldg_nb,
+        bldg_nm=bldg_nm,
+        flr=flr,
+        room=room,
+        pst_cd=postal,
+        twn_nm=town,
+        ctry_sub_div=re.sub(r"\s+", "", district) if district else None,
+        ctry=(country_hint.upper() if country_hint else None),
+        fragmentation_confidence=0.82,
+        fallback_used=True,
+    )
+
 def _is_artifact(value: Optional[str]) -> bool:
     if not value: return True
     v = str(value).strip()
@@ -78,6 +162,14 @@ def _fragment_single_line(
     postal_code_hint: Optional[str] = None,
     town_hint: Optional[str] = None,
 ) -> FragmentedAddress:
+    chinese_fragment = _extract_chinese_fragment(line, country_hint)
+    if chinese_fragment:
+        if not chinese_fragment.pst_cd:
+            chinese_fragment.pst_cd = _safe_hint(postal_code_hint)
+        if not chinese_fragment.twn_nm:
+            chinese_fragment.twn_nm = _safe_hint(town_hint)
+        return chinese_fragment
+
     try:
         parsed = parse_address_line(line)
         components = parsed.get("components", {})
