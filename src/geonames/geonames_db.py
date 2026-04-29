@@ -222,3 +222,69 @@ def resolve_locality_hierarchy(country_code: str, locality_name: str) -> Optiona
     
     # Fallback: retourne la localité elle-même
     return place.get("name")
+def get_parent_city_for_district(country_code: str, locality_name: str) -> Optional[dict]:
+    """
+    Identifie si une localité est un quartier (PPLX) et remonte à sa ville mère (PPL/PPLC).
+    Exemple: Canary Wharf (PPLX, admin1=ENG, admin2=GLA) -> London (PPLC, ENG, GLA)
+    """
+    place = find_place(country_code, locality_name)
+    if not place:
+        place = find_alternate_place(country_code, locality_name)
+    
+    if not place:
+        return None
+        
+    fc = place.get("feature_code")
+    # Si c'est déjà une ville majeure ou capitale, on ne fait rien
+    if fc in ('PPL', 'PPLC', 'PPLA', 'PPLA2', 'PPLA3', 'PPLA4'):
+        return None
+        
+    # Si c'est un quartier/banlieue (PPLX) ou suburb (PPLS)
+    if fc in ('PPLX', 'PPLS'):
+        admin1 = place.get("admin1_code")
+        
+        if not admin1:
+            return None
+            
+        # Chercher la ville PPL/PPLC/PPLA dans la même région (admin1+admin2)
+        conn = _connect()
+        try:
+            # On a besoin de admin2_code de la place actuelle
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT admin2_code FROM geonames_places WHERE geonameid = ?
+            """, (place["geonameid"],))
+            row_admin2 = cur.fetchone()
+            admin2 = row_admin2[0] if row_admin2 else ""
+            
+            # Recherche du parent (idéalement PPLC, PPLA, PPL)
+            query = """
+                SELECT geonameid, name, asciiname, country_code,
+                       feature_class, feature_code, population, admin1_code, admin2_code
+                FROM geonames_places
+                WHERE country_code = ?
+                  AND admin1_code = ?
+                  AND feature_code IN ('PPLC', 'PPLA', 'PPLA2', 'PPL')
+            """
+            params = [country_code, admin1]
+            
+            if admin2:
+                query += " AND admin2_code = ?"
+                params.append(admin2)
+                
+            query += " ORDER BY population DESC LIMIT 1"
+            
+            cur.execute(query, tuple(params))
+            row = cur.fetchone()
+            if row:
+                return {
+                    "geonameid": row[0], "name": row[1],
+                    "asciiname": row[2], "country_code": row[3],
+                    "feature_class": row[4], "feature_code": row[5],
+                    "population": row[6], "admin1_code": row[7],
+                    "admin2_code": row[8],
+                }
+            return None
+        finally:
+            conn.close()
+    return None

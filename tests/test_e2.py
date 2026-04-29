@@ -113,3 +113,19 @@ PARIS CENTRE
     assert result.country_town is not None
     assert result.country_town.town is None
     assert not any(w.startswith("pass1_town_not_found_worldwide") for w in result.meta.warnings)
+
+
+def test_validate_does_not_match_town_as_substring_inside_word():
+    raw = """:59F:/DE89370400440532013000
+1/MUELLER HANS
+2/BERLINER STRASSE 45
+3/DE/BERLIN 10115
+"""
+    p = preprocess(raw)
+    result = parse_field(p, message_id="MSG_E2_009")
+    result = validate_party_semantics(result)
+
+    assert not any(
+        w.startswith("pass2_address_contains_town_or_country:BERLINER STRASSE 45")
+        for w in result.meta.warnings
+    )

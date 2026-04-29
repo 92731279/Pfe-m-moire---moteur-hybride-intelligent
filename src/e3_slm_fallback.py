@@ -313,10 +313,6 @@ class E3SLMFallback:
         confidence = _meta_get(party.meta, 'parse_confidence', 0)
         warnings = _meta_get(party.meta, 'warnings', [])
         
-        # Pas besoin si déjà très bonne confiance et aucun signal fort
-        if confidence >= 0.85:
-            return False
-
         if _is_simple_country_only_gap(party, warnings):
             return False
         

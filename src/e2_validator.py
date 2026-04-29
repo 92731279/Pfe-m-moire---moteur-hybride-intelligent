@@ -92,6 +92,40 @@ def _prefer_input_town_when_canonical_expands(town_raw: str, canonical: Optional
     return can_n
 
 
+def _resolve_town_from_composite(country: str, town_source: str) -> Optional[Tuple[str, str]]:
+    """Try to resolve a composite locality (suburb + city) to an official city via GeoNames."""
+    if not GEONAMES_AVAILABLE or not country or not town_source:
+        return None
+
+    parts: List[str] = []
+    split_parts = [token for token in re.split(r"[,/;]", town_source) if token and token.strip()]
+    for token in reversed(split_parts):
+        clean = canonicalize_toponym(_norm(token))
+        if clean and not re.search(r"\d", clean):
+            parts.append(clean)
+
+    collapsed = canonicalize_toponym(_norm(town_source))
+    if collapsed:
+        tokens = collapsed.split()
+        for size in range(min(3, len(tokens)), 0, -1):
+            candidate = " ".join(tokens[-size:])
+            if candidate and not re.search(r"\d", candidate):
+                parts.append(candidate)
+
+    seen = set()
+    for candidate in parts:
+        candidate_n = _norm(candidate)
+        if not candidate_n or candidate_n in seen:
+            continue
+        seen.add(candidate_n)
+        is_valid, canonical, matched_via = validate_town_in_country(country, candidate_n)
+        if is_valid and canonical and matched_via:
+            chosen = _prefer_input_town_when_canonical_expands(candidate_n, canonical)
+            return _norm(chosen), matched_via
+
+    return None
+
+
 def _looks_like_local_script_town(country: str, town: str) -> bool:
     if not country or not town:
         return False
@@ -134,7 +168,8 @@ def _validate_pass1_country_town(party: CanonicalParty) -> Tuple[str, str, bool,
     warnings = party.meta.warnings
     geo = party.country_town
     country = _norm(geo.country) if geo else ""
-    town_raw = canonicalize_toponym(_norm(geo.town)) if geo else ""
+    town_source = _norm(geo.town) if geo else ""
+    town_raw = canonicalize_toponym(town_source) if geo else ""
 
     # 1. 🔍 Détection du contexte "suburb/quartier" dans les lignes d'adresse brutes
     SUBURB_KEYWORDS = {"CITE", "CITÉ", "ZONE", "QUARTIER", "SECTEUR", "IMMEUBLE", "IMM", "LOTISSEMENT"}
@@ -144,48 +179,63 @@ def _validate_pass1_country_town(party: CanonicalParty) -> Tuple[str, str, bool,
     )
     is_town_literally_a_suburb = any(kw in town_raw.upper() for kw in SUBURB_KEYWORDS)
 
+
     # 2. ✅ Validation GeoNames PRIORITAIRE (si la ville existe, on la garde / la promeut)
     if GEONAMES_AVAILABLE and country and town_raw:
         is_valid, canonical, matched_via = validate_town_in_country(country, town_raw)
         if is_valid and matched_via and not is_town_literally_a_suburb:
-            chosen_town = _prefer_input_town_when_canonical_expands(town_raw, canonical)
-            warnings.append(f"pass1_town_confirmed_geonames:{matched_via}")
+
+            if matched_via == "district_promotion":
+                chosen_town = canonical.upper() if canonical else town_raw
+            else:
+                chosen_town = _prefer_input_town_when_canonical_expands(town_raw, canonical)
+                
+            _append_warning_once(warnings, f"pass1_town_confirmed_geonames:{matched_via}")
             if has_suburb_context:
-                warnings.append("pass1_town_extracted_from_suburb_and_confirmed")
+                _append_warning_once(warnings, "pass1_town_extracted_from_suburb_and_confirmed")
             
             # ✅ CORRECTION: Nettoyage des alertes de blocage précédentes si on a récupéré une ville (ex: Post-SLM ou Post-Fragment)
             warnings[:] = [w for w in warnings if "requires_manual_verification" not in str(w)]
             
             # ✅ CORRECTION: Conserver la localité exacte (ex: Douar Hicher) au lieu de promouvoir!
-            parent_town = resolve_locality_hierarchy(country, town_raw)
-            if parent_town and parent_town.upper() != _norm(chosen_town):
-                # C'est une localité avec un parent administratif, mais on garde la localité précise
-                warnings.append(f"pass1_locality_has_parent:{chosen_town}→{parent_town}")
-                return country, _norm(chosen_town), True, False
+            if matched_via != "district_promotion":
+                parent_town = resolve_locality_hierarchy(country, town_raw)
+                if parent_town and parent_town.upper() != _norm(chosen_town):
+                    # C'est une localité avec un parent administratif, mais on garde la localité précise
+                    warnings.append(f"pass1_locality_has_parent:{chosen_town}→{parent_town}")
+                    return country, _norm(chosen_town), True, False
             
             return country, _norm(chosen_town), True, False
         else:
-            warnings.append(f"pass1_town_not_official:{town_raw}")
+            _append_warning_once(warnings, f"pass1_town_not_official:{town_raw}")
+
+            composite_resolution = _resolve_town_from_composite(country, town_source or town_raw)
+            if composite_resolution:
+                resolved_town, matched_via = composite_resolution
+                _append_warning_once(warnings, f"pass1_town_resolved_from_composite:{town_raw}->{resolved_town}:{matched_via}")
+                warnings[:] = [w for w in warnings if "requires_manual_verification" not in str(w)]
+                return country, resolved_town, True, False
+
             if _looks_like_local_script_town(country, town_raw):
-                warnings.append("pass1_town_local_script_accepted")
+                _append_warning_once(warnings, "pass1_town_local_script_accepted")
                 warnings[:] = [w for w in warnings if "requires_manual_verification" not in str(w)]
                 return country, town_raw, True, False
             inferred_town = _infer_town_from_address_lines(country, party.address_lines or [])
             if inferred_town:
-                warnings.append(f"pass1_town_inferred_from_address:{inferred_town}")
+                _append_warning_once(warnings, f"pass1_town_inferred_from_address:{inferred_town}")
                 warnings[:] = [w for w in warnings if "requires_manual_verification" not in str(w)]
                 return country, inferred_town.upper(), True, False
             if is_town_literally_a_suburb:
-                warnings.append("pass1_town_is_suburb_keyword_rejected")
-                warnings.append("requires_manual_verification:suburb_cannot_be_promoted_to_city")
+                _append_warning_once(warnings, "pass1_town_is_suburb_keyword_rejected")
+                _append_warning_once(warnings, "requires_manual_verification:suburb_cannot_be_promoted_to_city")
                 party.meta.parse_confidence = min(party.meta.parse_confidence, 0.40)
                 return country, None, False, True
             if has_suburb_context:
-                warnings.append("pass1_suburb_context_detected_and_town_invalid")
-                warnings.append("requires_manual_verification:suburb_cannot_be_promoted_to_city")
+                _append_warning_once(warnings, "pass1_suburb_context_detected_and_town_invalid")
+                _append_warning_once(warnings, "requires_manual_verification:suburb_cannot_be_promoted_to_city")
                 party.meta.parse_confidence = min(party.meta.parse_confidence, 0.40)
                 return country, None, False, True
-            warnings.append("requires_manual_verification:town_unverified")
+            _append_warning_once(warnings, "requires_manual_verification:town_unverified")
             return country, None, False, True
 
     # 3. 🚫 BLOCAGE STRICT si contexte suburb détecté et pas de ville
@@ -197,6 +247,10 @@ def _validate_pass1_country_town(party: CanonicalParty) -> Tuple[str, str, bool,
 
     elif not country:
         warnings.append("pass1_country_missing")
+        return country, None, False, True
+
+    if not town_raw:
+        warnings.append("town_missing")
         return country, None, False, True
 
     # Fallback safe : on garde la valeur brute
@@ -295,9 +349,20 @@ def _check_address_geo_consistency(components: Dict, raw_line: str, town: str, c
     return False
 
 def _line_contains_town_or_country(line: str, town: str, country: str) -> bool:
-    line_n = _norm(line)
-    if town and _norm(town) in line_n: return True
-    if country and _norm(country) in line_n: return True
+    line_n = _norm(re.sub(r"[^A-Z0-9]+", " ", line or ""))
+    if not line_n:
+        return False
+
+    town_n = _norm(re.sub(r"[^A-Z0-9]+", " ", town or ""))
+    if town_n:
+        if re.search(rf"(?:^|\s){re.escape(town_n)}(?:\s|$)", line_n):
+            return True
+
+    country_n = _norm(re.sub(r"[^A-Z0-9]+", " ", country or ""))
+    if country_n:
+        if re.search(rf"(?:^|\s){re.escape(country_n)}(?:\s|$)", line_n):
+            return True
+
     return False
 
 # ============================================================

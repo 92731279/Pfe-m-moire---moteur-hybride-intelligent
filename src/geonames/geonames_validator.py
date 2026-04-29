@@ -8,7 +8,7 @@ import re
 import unicodedata
 from typing import Optional, Tuple
 from src.geonames.geonames_db import (
-    find_place, find_alternate_place, find_place_fuzzy
+    find_place, find_alternate_place, find_place_fuzzy, get_parent_city_for_district
 )
 
 
@@ -43,12 +43,17 @@ def validate_town_in_country(
 
     town_n = _normalize(town_name)
 
-    # --- Niveau 1 : Recherche exacte ---
+    # --- Niveau 1 : Promotion prioritaire de Quartier vers Ville ---
+    parent = get_parent_city_for_district(country_code, town_name)
+    if parent:
+        return True, parent["name"], "district_promotion"
+
+    # --- Niveau 2 : Recherche exacte ---
     result = find_place(country_code, town_n)
     if result:
         return True, result["name"], "exact"
 
-    # --- Niveau 2 : Noms alternatifs ---
+    # --- Niveau 3 : Noms alternatifs ---
     result = find_alternate_place(country_code, town_n)
     if result:
         return True, result["name"], "alternate"
@@ -69,6 +74,11 @@ def validate_town_in_country(
         result = find_place_fuzzy(country_code, town_n)
         if result:
             return True, result["name"], f"fuzzy:{result['name']}"
+
+    # --- Niveau 5 : Promotion de quartier vers Ville ---
+    parent = get_parent_city_for_district(country_code, town_name)
+    if parent:
+        return True, parent["name"], "district_promotion"
 
     return False, None, None
 

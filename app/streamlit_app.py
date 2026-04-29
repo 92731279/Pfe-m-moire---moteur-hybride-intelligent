@@ -3,8 +3,11 @@
 import os
 import sys
 import json
+import re
 import streamlit as st
 import time
+import io
+import zipfile
 from pathlib import Path
 import textwrap
 import html
@@ -22,6 +25,7 @@ for m in list(sys.modules.keys()):
 from src.pipeline import run_pipeline
 from src.pipeline_logger import PipelineLogger
 from src.iso20022_mapper import build_iso20022_party_xml
+import src.pipeline as pipeline_module
 
 def compute_geo_reliability(result):
     score = 0.0
@@ -678,6 +682,15 @@ def render_hero(title: str, subtitle: str, badge: str = "LIVE"):
     </div>
     ''').strip(), unsafe_allow_html=True)
 
+
+def _normalize_pipeline_step(step_id: str) -> str:
+    """Map internal sub-steps to the visual pipeline stages."""
+    if not step_id:
+        return step_id
+    if step_id in {"E2B", "E2.5B"}:
+        return "E3"
+    return step_id
+
 def render_pipeline_status(current_step=None):
     steps = [
         ("INPUT", "📥 Entrée"),
@@ -685,17 +698,19 @@ def render_pipeline_status(current_step=None):
         ("E1", "⚙️ Parsing"),
         ("E2", "🌍 Validation"),
         ("E2.5", "✂️ Fragmentation"),
+        ("E3", "🤖 SLM (si nécessaire)"),
         ("DECISION", "🧠 Décision"),
         ("OUTPUT", "📤 Sortie")
     ]
+    current_visual_step = _normalize_pipeline_step(current_step)
     html_parts = ['<div class="pipeline-wrap">']
     for sid, sname in steps:
         cls = "pipeline-step"
-        if current_step == sid:
+        if current_visual_step == sid:
             cls += " active"
-        elif current_step:
+        elif current_visual_step:
             try:
-                idx_current = [s[0] for s in steps].index(current_step)
+                idx_current = [s[0] for s in steps].index(current_visual_step)
                 idx_step = [s[0] for s in steps].index(sid)
                 if idx_step < idx_current:
                     cls += " success"
@@ -729,6 +744,138 @@ def render_status_badge(success: bool, text: str):
         {icon} {html.escape(text)}
     </div>
     ''').strip()
+
+
+def _humanize_signal(signal: str) -> str:
+    if not signal:
+        return "Signal vide"
+
+    signal = str(signal)
+
+    exact_map = {
+        "pass2_soft:missing_road_like_component": "Adresse partielle: composant voie non explicite, mais extraction acceptable.",
+        "pass2_geo_incoherent_cannot_validate_address": "Incoherence geo: l'adresse ne peut pas etre validee avec la ville/pays extraits.",
+        "pass2_address_missing": "Adresse manquante apres parsing.",
+        "pass1_town_ambiguous_requires_disambiguation": "Ville ambigue: verification manuelle recommandee.",
+        "requires_manual_verification:town_unverified": "Ville non verifiee: revue manuelle requise.",
+        "line_8_non_identifier_narrative": "Ligne 8 detectee comme texte narratif, pas comme identifiant.",
+        "T56_invalid_8_semantic_content": "Ligne 8 semantiquement invalide pour le format T56.",
+        "slm_applied": "Fallback SLM applique pour renforcer l'extraction.",
+        "quarantine_manual_review_required": "Message place en quarantaine pour revue manuelle.",
+        "mandatory_missing:town": "Rejet: ville obligatoire manquante.",
+        "mandatory_missing:country": "Rejet: pays obligatoire manquant.",
+    }
+    if signal in exact_map:
+        return exact_map[signal]
+
+    if signal.startswith("pass1_town_confirmed_geonames:"):
+        method = signal.split(":", 1)[1]
+        return f"Ville confirmee par GeoNames ({method})."
+    if signal.startswith("pass2_town_backfilled_from_fragmentation:"):
+        town = signal.split(":", 1)[1]
+        return f"Ville completee automatiquement depuis la fragmentation ({town})."
+    if signal.startswith("pass1_town_not_official:"):
+        town = signal.split(":", 1)[1]
+        return f"Ville non officielle au format saisi ({town}), tentative de resolution appliquee."
+    if signal.startswith("pass1_town_resolved_from_composite:"):
+        details = signal.split(":", 1)[1]
+        return f"Toponyme compose resolu avec succes ({details})."
+    if signal.startswith("pass1_town_inferred_from_address:"):
+        town = signal.split(":", 1)[1]
+        return f"Ville deduite depuis les lignes d'adresse ({town})."
+    if signal.startswith("pass2_address_contains_town_or_country:"):
+        line = signal.split(":", 1)[1]
+        return f"Adresse contient deja une information geo (ville/pays): {line}."
+    if signal.startswith("country_from_iban"):
+        return "Pays deduit depuis l'IBAN."
+    if signal.startswith("country_conflict_iban_hint_only:"):
+        conflict = signal.split(":", 1)[1]
+        return f"Conflit pays entre IBAN et contenu explicite ({conflict})."
+
+    return signal.replace("_", " ").strip().capitalize()
+
+
+def _render_human_signal_list(title: str, signals, empty_text: str = "Aucun signal"):
+    st.markdown(f"**{title}**")
+    if not signals:
+        st.success(empty_text)
+        return
+
+    for sig in signals:
+        human = _humanize_signal(sig)
+        st.markdown(
+            f"- {human}<br><span style='color:var(--text-muted); font-size:0.78rem;'>Code: {html.escape(str(sig))}</span>",
+            unsafe_allow_html=True,
+        )
+
+
+def _is_final_error_signal(signal: str) -> bool:
+    if not signal:
+        return False
+
+    signal = str(signal)
+    critical_prefixes = (
+        "mandatory_missing:",
+        "quarantine_",
+        "requires_manual_verification:",
+        "invalid_",
+        "T56_invalid_",
+        "pass1_country_missing",
+        "pass1_missing_country_town",
+        "pass1_town_is_suburb_keyword_rejected",
+        "pass1_suburb_context_detected",
+        "pass1_suburb_context_detected_and_town_invalid",
+        "pass2_no_valid_address_detected",
+        "pass2_invalid_address_line:",
+        "pass2_geo_incoherent_cannot_validate_address",
+        "country_conflict_iban_hint_only:",
+    )
+    if signal in {
+        "pass1_town_ambiguous_requires_disambiguation",
+        "pass1_town_not_official",
+        "pass1_town_not_official:XX INVALID COUNTRY",
+        "pass2_address_missing",
+    }:
+        return True
+    return any(signal.startswith(prefix) for prefix in critical_prefixes)
+
+
+def _filter_final_error_signals(signals):
+    return [signal for signal in (signals or []) if _is_final_error_signal(signal)]
+
+
+def _render_final_signal_panel(result):
+    rejected = bool(getattr(result.meta, "rejected", False))
+    rejection_reasons = _filter_final_error_signals(getattr(result.meta, "rejection_reasons", []) or [])
+    warnings = _filter_final_error_signals(getattr(result.meta, "warnings", []) or [])
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+        parse_conf = result.meta.parse_confidence or 0.0
+        st.write(f"**Confiance Parse :** {parse_conf:.2f}")
+        st.write(f"**Rejete :** {'Oui' if rejected else 'Non'}")
+        if rejected:
+            _render_human_signal_list(
+                "Raisons de decision",
+                rejection_reasons,
+                empty_text="Aucune raison de rejet finale",
+            )
+        else:
+            st.success("Aucun rejet final")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with c2:
+        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+        if rejected:
+            _render_human_signal_list(
+                "Warnings de validation",
+                warnings,
+                empty_text="Aucun warning critique final",
+            )
+        else:
+            st.success("Warnings internes nettoyes apres correction")
+        st.markdown('</div>', unsafe_allow_html=True)
 
 def render_result_card(result, elapsed: float):
     is_rejected = getattr(result.meta, 'rejected', False)
@@ -801,7 +948,8 @@ class StreamlitLiveLogger(PipelineLogger):
         color_class = self.step_colors.get(step, "trace-info")
         if "rejeté" in message.lower() or "erreur" in message.lower(): color_class = "trace-fail"
         if "Terminé" in message or "terminée" in message: color_class = "trace-success"
-        if "SLM" in step: color_class = "trace-slm"
+        if step in {"E3", "E2B", "E2.5B"} or "SLM" in message.upper():
+            color_class = "trace-slm"
 
         details = ""
         if data:
@@ -819,12 +967,59 @@ class StreamlitLiveLogger(PipelineLogger):
 # DATA LOAD
 # ═══════════════════════════════════════════════════════════════════════════════
 SAMPLES_PATH = Path(PROJECT_ROOT) / "data" / "samples" / "mt103_party_cases.json"
+GLOBAL_CORPUS_PATH = Path(PROJECT_ROOT) / "data" / "samples" / "mt103_global_test_corpus.txt"
+CASE_HEADER_PATTERN = re.compile(r"^===\s*CASE\s+(\d+)\s*===\s*$", re.IGNORECASE)
+
+
+def _parse_global_corpus_cases(corpus_text: str):
+    cases = []
+    current_case_id = None
+    current_lines = []
+
+    def flush_case():
+        nonlocal current_case_id, current_lines
+        if not current_case_id:
+            return
+        while current_lines and not current_lines[0].strip():
+            current_lines.pop(0)
+        while current_lines and not current_lines[-1].strip():
+            current_lines.pop()
+        if not current_lines:
+            return
+        cases.append({
+            "label": f"🌍 Global Corpus - CASE {current_case_id}",
+            "category": "global_corpus",
+            "source": "data/samples/mt103_global_test_corpus.txt",
+            "raw_message": "\n".join(current_lines),
+        })
+
+    for raw_line in corpus_text.splitlines():
+        line = raw_line.rstrip("\n")
+        match = CASE_HEADER_PATTERN.match(line.strip())
+        if match:
+            flush_case()
+            current_case_id = match.group(1).zfill(3)
+            current_lines = []
+            continue
+        if current_case_id:
+            current_lines.append(line)
+
+    flush_case()
+    return cases
+
+
+def _load_global_corpus_cases():
+    if not GLOBAL_CORPUS_PATH.exists():
+        return []
+    with open(GLOBAL_CORPUS_PATH, "r", encoding="utf-8") as f:
+        return _parse_global_corpus_cases(f.read())
 
 def load_cases():
     base_cases = []
     if SAMPLES_PATH.exists():
         with open(SAMPLES_PATH, "r", encoding="utf-8") as f:
             base_cases = json.load(f)
+    global_corpus_cases = _load_global_corpus_cases()
     extreme_cases = [
         {
             "label": "🔥 EXTRÊME - Sans retour chariot (Chaos Total)",
@@ -842,10 +1037,101 @@ def load_cases():
             "category": "extreme"
         }
     ]
-    return extreme_cases + base_cases
+    return extreme_cases + global_corpus_cases + base_cases
 
 cases = load_cases()
 options = {f"{c['label']}": c["raw_message"] for c in cases}
+
+
+def _safe_dump_model(obj):
+    try:
+        return obj.model_dump()
+    except Exception:
+        try:
+            import dataclasses
+            if dataclasses.is_dataclass(obj):
+                return dataclasses.asdict(obj)
+        except Exception:
+            pass
+        return vars(obj)
+
+
+def _run_case(raw_message: str, message_id: str = "UI_CASE", slm_model: str = "qwen2.5:0.5b"):
+    class SilentLogger(PipelineLogger):
+        def log(self, *args, **kwargs):
+            super().log(*args, **kwargs)
+
+    logger = SilentLogger()
+    start = time.time()
+    result, _ = run_pipeline(
+        raw_message=raw_message,
+        message_id=message_id,
+        slm_model=slm_model,
+        logger=logger,
+    )
+    elapsed = round(time.time() - start, 3)
+    iso_xml, iso_payload, iso_errors = build_iso20022_party_xml(result, include_envelope=True)
+    return result, logger, elapsed, iso_xml, iso_payload, iso_errors
+
+
+def _run_case_without_slm(raw_message: str, message_id: str = "UI_CASE_NO_SLM"):
+    class SilentLogger(PipelineLogger):
+        def log(self, *args, **kwargs):
+            super().log(*args, **kwargs)
+
+    original_needs = pipeline_module.needs_slm_fallback
+    original_apply = pipeline_module.apply_slm_fallback
+    try:
+        pipeline_module.needs_slm_fallback = lambda party: False
+        pipeline_module.apply_slm_fallback = lambda party, model="qwen2.5:0.5b": party
+        logger = SilentLogger()
+        start = time.time()
+        result, _ = run_pipeline(
+            raw_message=raw_message,
+            message_id=message_id,
+            slm_model="qwen2.5:0.5b",
+            logger=logger,
+        )
+        elapsed = round(time.time() - start, 3)
+        return result, logger, elapsed
+    finally:
+        pipeline_module.needs_slm_fallback = original_needs
+        pipeline_module.apply_slm_fallback = original_apply
+
+
+def _extract_kpis(results_rows):
+    total = len(results_rows)
+    accepted = sum(1 for r in results_rows if not r["rejected"])
+    fallback = sum(1 for r in results_rows if r["fallback_used"])
+    with_country = sum(1 for r in results_rows if r["country"])
+    with_town = sum(1 for r in results_rows if r["town"])
+    with_postal = sum(1 for r in results_rows if r["postal_code"])
+    avg_conf = round(sum(r["confidence"] for r in results_rows) / total, 3) if total else 0.0
+    return {
+        "total": total,
+        "accepted": accepted,
+        "rejected": total - accepted,
+        "acceptance_rate": round((accepted / total) * 100, 1) if total else 0.0,
+        "fallback_rate": round((fallback / total) * 100, 1) if total else 0.0,
+        "avg_confidence": avg_conf,
+        "country_coverage": round((with_country / total) * 100, 1) if total else 0.0,
+        "town_coverage": round((with_town / total) * 100, 1) if total else 0.0,
+        "postal_coverage": round((with_postal / total) * 100, 1) if total else 0.0,
+    }
+
+
+def _result_row_from_case(case_label, result, elapsed):
+    return {
+        "case": case_label,
+        "elapsed_s": elapsed,
+        "confidence": float(getattr(result.meta, "parse_confidence", 0.0) or 0.0),
+        "rejected": bool(getattr(result.meta, "rejected", False)),
+        "fallback_used": bool(getattr(result.meta, "fallback_used", False)),
+        "country": (result.country_town.country if result.country_town else None),
+        "town": (result.country_town.town if result.country_town else None),
+        "postal_code": (result.country_town.postal_code if result.country_town else None),
+        "warnings": len(getattr(result.meta, "warnings", []) or []),
+    }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR — Premium Navigation
@@ -862,7 +1148,18 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["🚀 Mode Avancé", "✅ Mode Validation", "📐 Architecture"],
+        [
+            "🚀 Mode Avancé",
+            "✅ Mode Validation",
+            "📐 Architecture",
+            "🎬 Démo Guidée",
+            "🧠 Avant/Après SLM",
+            "🔎 Explainability",
+            "📊 KPI Dashboard",
+            "🧪 Comparateur Multi-cas",
+            "📦 Export Pro",
+            "🗂️ Banque de Cas",
+        ],
         label_visibility="collapsed"
     )
 
@@ -943,7 +1240,7 @@ if page == "🚀 Mode Avancé":
 
             # Onglets techniques
             st.markdown('<div class="section-title">🗂️ Détails Techniques</div>', unsafe_allow_html=True)
-            t1, t2, t3, t4, t5 = st.tabs(["📋 JSON Complet", "⚠️ Signaux", "✂️ Fragments", "🧩 JSON ISO 20022", "🧾 XML ISO 20022"])
+            t1, t2, t3, t4, t5 = st.tabs(["📋 JSON Complet", "✅ Décision Finale", "✂️ Fragments", "🧩 JSON ISO 20022", "🧾 XML ISO 20022"])
 
             with t1:
                 with st.container():
@@ -956,18 +1253,7 @@ if page == "🚀 Mode Avancé":
                     st.markdown('</div>', unsafe_allow_html=True)
 
             with t2:
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-                    st.write(f"**Confiance Parse :** `{result.meta.parse_confidence}`")
-                    st.write(f"**Rejeté :** `{result.meta.rejected}`")
-                    st.write(f"**Raisons :** `{result.meta.rejection_reasons}`")
-                    st.markdown('</div>', unsafe_allow_html=True)
-                with c2:
-                    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-                    st.write(f"**Warnings :** `{result.meta.warnings}`")
-                    st.write(f"**Signaux SLM :** `{result.meta.llm_signals}`")
-                    st.markdown('</div>', unsafe_allow_html=True)
+                _render_final_signal_panel(result)
 
             with t3:
                 frag_list = getattr(result, 'fragmented_addresses', [])
@@ -1201,3 +1487,264 @@ elif page == "📐 Architecture":
                 </div>
                 """).strip(), unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 4 — DÉMO GUIDÉE
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "🎬 Démo Guidée":
+    render_hero(
+        "Démo Guidée Automatique",
+        "Exécution séquentielle de cas représentatifs pour la soutenance",
+        "SHOWCASE"
+    )
+
+    default_demo_cases = [c["label"] for c in cases[:5]]
+    selected_demo_cases = st.multiselect(
+        "Cas de la démo",
+        options=list(options.keys()),
+        default=default_demo_cases,
+    )
+
+    if st.button("▶️ Lancer la démo complète"):
+        if not selected_demo_cases:
+            st.warning("Sélectionnez au moins un cas.")
+        else:
+            rows = []
+            progress = st.progress(0)
+            status_box = st.empty()
+            for idx, label in enumerate(selected_demo_cases):
+                status_box.info(f"Exécution: {label}")
+                result, logger, elapsed, _, _, _ = _run_case(options[label], message_id=f"DEMO_{idx+1:03d}")
+                rows.append(_result_row_from_case(label, result, elapsed))
+                progress.progress((idx + 1) / len(selected_demo_cases))
+
+            kpis = _extract_kpis(rows)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Cas", kpis["total"])
+            c2.metric("Acceptation", f"{kpis['acceptance_rate']}%")
+            c3.metric("Fallback SLM", f"{kpis['fallback_rate']}%")
+            c4.metric("Confiance Moy.", kpis["avg_confidence"])
+            st.dataframe(rows, use_container_width=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 5 — AVANT / APRÈS SLM
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "🧠 Avant/Après SLM":
+    render_hero(
+        "Comparatif Avant / Après SLM",
+        "Mise en évidence des champs corrigés par le fallback SLM",
+        "HYBRID VALUE"
+    )
+
+    case_label = st.selectbox("Cas", options=list(options.keys()))
+    raw_message = st.text_area("Message SWIFT", value=options[case_label], height=190)
+
+    if st.button("🔬 Comparer avant/après"):
+        before, logger_before, elapsed_before = _run_case_without_slm(raw_message, message_id="BEFORE_SLM")
+        after, logger_after, elapsed_after, _, _, _ = _run_case(raw_message, message_id="AFTER_SLM")
+
+        def _fields_view(r):
+            return {
+                "name": " | ".join(r.name or []),
+                "address": " | ".join(r.address_lines or []),
+                "town": r.country_town.town if r.country_town else None,
+                "country": r.country_town.country if r.country_town else None,
+                "postal_code": r.country_town.postal_code if r.country_town else None,
+                "confidence": getattr(r.meta, "parse_confidence", 0.0),
+                "rejected": getattr(r.meta, "rejected", False),
+            }
+
+        b = _fields_view(before)
+        a = _fields_view(after)
+        changed = [k for k in b if b[k] != a[k]]
+
+        col_b, col_a = st.columns(2, gap="large")
+        with col_b:
+            st.markdown("### Avant (sans SLM)")
+            st.metric("Temps", f"{elapsed_before}s")
+            st.json(b)
+        with col_a:
+            st.markdown("### Après (avec SLM)")
+            st.metric("Temps", f"{elapsed_after}s")
+            st.json(a)
+
+        st.markdown("### Différences détectées")
+        if changed:
+            for key in changed:
+                st.markdown(f"- **{key}**: `{b[key]}` → `{a[key]}`")
+        else:
+            st.success("Aucune différence entre les deux exécutions.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 6 — EXPLAINABILITY
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "🔎 Explainability":
+    render_hero(
+        "Explainability",
+        "Pourquoi accepté / rejeté, et quels signaux ont guidé la décision",
+        "AUDIT"
+    )
+
+    case_label = st.selectbox("Cas d'analyse", options=list(options.keys()))
+    raw_message = st.text_area("Message", value=options[case_label], height=180)
+
+    if st.button("🧾 Expliquer la décision"):
+        result, logger, elapsed, _, _, _ = _run_case(raw_message, message_id="EXPLAIN")
+        st.markdown(render_result_card(result, elapsed), unsafe_allow_html=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            _render_human_signal_list("Rejection reasons", getattr(result.meta, "rejection_reasons", []), "Aucune raison de rejet")
+        with c2:
+            _render_human_signal_list("Warnings", getattr(result.meta, "warnings", []), "Aucun warning")
+
+        st.markdown("### Timeline des étapes")
+        timeline_rows = [
+            {
+                "step": e.step,
+                "time": e.timestamp,
+                "level": e.level,
+                "message": e.message,
+            }
+            for e in logger.events
+        ]
+        st.dataframe(timeline_rows, use_container_width=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 7 — KPI DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "📊 KPI Dashboard":
+    render_hero(
+        "Dashboard KPI",
+        "Mesures globales du moteur sur un lot de cas",
+        "METRICS"
+    )
+
+    default_kpi_cases = [c["label"] for c in cases[: min(12, len(cases))]]
+    selected_cases = st.multiselect("Cas inclus", options=list(options.keys()), default=default_kpi_cases)
+    run_kpi = st.button("📈 Calculer les KPI")
+
+    if run_kpi:
+        rows = []
+        for idx, label in enumerate(selected_cases):
+            result, _, elapsed, _, _, _ = _run_case(options[label], message_id=f"KPI_{idx+1:03d}")
+            rows.append(_result_row_from_case(label, result, elapsed))
+
+        kpis = _extract_kpis(rows)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total", kpis["total"])
+        m2.metric("Acceptation", f"{kpis['acceptance_rate']}%")
+        m3.metric("Fallback SLM", f"{kpis['fallback_rate']}%")
+        m4.metric("Confiance Moy.", kpis["avg_confidence"])
+
+        m5, m6, m7 = st.columns(3)
+        m5.metric("Coverage Country", f"{kpis['country_coverage']}%")
+        m6.metric("Coverage Town", f"{kpis['town_coverage']}%")
+        m7.metric("Coverage Postal", f"{kpis['postal_coverage']}%")
+
+        st.dataframe(rows, use_container_width=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 8 — COMPARATEUR MULTI-CAS
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "🧪 Comparateur Multi-cas":
+    render_hero(
+        "Comparateur Multi-cas",
+        "Comparer rapidement les sorties, la confiance et la décision",
+        "BENCH"
+    )
+
+    selected = st.multiselect("Sélectionner les cas", options=list(options.keys()), default=list(options.keys())[:3])
+    if st.button("⚖️ Comparer"):
+        rows = []
+        for idx, label in enumerate(selected):
+            result, _, elapsed, _, _, _ = _run_case(options[label], message_id=f"CMP_{idx+1:03d}")
+            rows.append(_result_row_from_case(label, result, elapsed))
+        st.dataframe(rows, use_container_width=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 9 — EXPORT PRO
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "📦 Export Pro":
+    render_hero(
+        "Export Professionnel",
+        "Téléchargement JSON + XML + Trace dans une archive ZIP",
+        "EXPORT"
+    )
+
+    case_label = st.selectbox("Cas à exporter", options=list(options.keys()))
+    raw_message = st.text_area("Message", value=options[case_label], height=180)
+
+    if st.button("📤 Générer les exports"):
+        result, logger, elapsed, iso_xml, iso_payload, iso_errors = _run_case(raw_message, message_id="EXPORT")
+        result_dump = _safe_dump_model(result)
+        trace_dump = logger.as_dicts()
+
+        st.download_button(
+            "Télécharger JSON résultat",
+            data=json.dumps(result_dump, ensure_ascii=False, indent=2),
+            file_name="result.json",
+            mime="application/json",
+        )
+        st.download_button(
+            "Télécharger JSON ISO 20022",
+            data=json.dumps(iso_payload, ensure_ascii=False, indent=2),
+            file_name="iso20022_payload.json",
+            mime="application/json",
+        )
+        st.download_button(
+            "Télécharger XML ISO 20022",
+            data=iso_xml,
+            file_name="iso20022.xml",
+            mime="application/xml",
+        )
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("input.txt", raw_message)
+            zf.writestr("result.json", json.dumps(result_dump, ensure_ascii=False, indent=2))
+            zf.writestr("trace.json", json.dumps(trace_dump, ensure_ascii=False, indent=2))
+            zf.writestr("iso20022_payload.json", json.dumps(iso_payload, ensure_ascii=False, indent=2))
+            zf.writestr("iso20022.xml", iso_xml)
+            zf.writestr("metadata.json", json.dumps({
+                "elapsed_s": elapsed,
+                "iso_errors": iso_errors,
+                "fallback_used": bool(getattr(result.meta, "fallback_used", False)),
+            }, ensure_ascii=False, indent=2))
+        st.download_button(
+            "⬇️ Télécharger package ZIP complet",
+            data=zip_buffer.getvalue(),
+            file_name="swift_engine_export.zip",
+            mime="application/zip",
+        )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 10 — BANQUE DE CAS
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "🗂️ Banque de Cas":
+    render_hero(
+        "Banque de Cas",
+        "Catalogue des scénarios de test avec filtres par catégorie",
+        "LIBRARY"
+    )
+
+    categories = sorted({c.get("category", "autre") for c in cases})
+    selected_category = st.selectbox("Filtrer par catégorie", ["toutes"] + categories)
+    filtered_cases = [c for c in cases if selected_category == "toutes" or c.get("category", "autre") == selected_category]
+
+    st.write(f"{len(filtered_cases)} cas affichés")
+    case_labels = [c["label"] for c in filtered_cases]
+    selected_case = st.selectbox("Cas", case_labels) if case_labels else None
+
+    if selected_case:
+        case_obj = next(c for c in filtered_cases if c["label"] == selected_case)
+        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+        st.write(f"**Label**: {case_obj.get('label')}")
+        st.write(f"**Catégorie**: {case_obj.get('category', 'autre')}")
+        st.write(f"**Source**: {case_obj.get('source', 'N/A')}")
+        st.code(case_obj.get("raw_message", ""), language="text")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        if st.button("▶️ Exécuter ce cas"):
+            result, _, elapsed, _, _, _ = _run_case(case_obj.get("raw_message", ""), message_id="CASE_LIBRARY")
+            st.markdown(render_result_card(result, elapsed), unsafe_allow_html=True)

@@ -71,6 +71,38 @@ def test_pipeline_59f_creditor():
     assert result.country_town.country == "CN"
 
 
+def test_pipeline_free_59_keeps_city_from_comma_line(monkeypatch):
+    monkeypatch.setattr("src.pipeline.needs_slm_fallback", lambda party: False)
+    raw = ":59:Creditor Name\n60 Esplanadi, Helsinki\n"
+
+    result, _ = run_pipeline(raw, message_id="TEST_PIPE_006")
+
+    assert result.meta.rejected is False
+    assert result.country_town.country == "FI"
+    assert result.country_town.town == "HELSINKI"
+    assert result.address_lines == ["60 ESPLANADI"]
+    assert result.meta.fallback_used is False
+
+
+def test_pipeline_50k_resolves_composite_town_for_ghana(monkeypatch):
+    monkeypatch.setattr("src.pipeline.needs_slm_fallback", lambda party: False)
+    raw = """:50K:/USD1700600011515
+MUNIRU HOUSE STYLE ENT
+NO. E 59 BUOKROM ESTATE
+TAFO, KUMASI
+GHANA
+"""
+
+    result, _ = run_pipeline(raw, message_id="TEST_PIPE_007")
+
+    assert result.meta.rejected is False
+    assert result.country_town.country == "GH"
+    assert result.country_town.town == "KUMASI"
+    assert result.address_lines == ["NO. E 59 BUOKROM ESTATE"]
+    assert not any("requires_manual_verification:town_unverified" in str(w) for w in result.meta.warnings)
+    assert result.meta.fallback_used is False
+
+
 def test_pipeline_slm_success_recalibrates_confidence(monkeypatch):
     raw = ":59:/123456 MONSIEUR BOURGUIBA HABIB RUE DE LA LIBERTE APPT 4B 8000 NABEUL TUNISIE"
 

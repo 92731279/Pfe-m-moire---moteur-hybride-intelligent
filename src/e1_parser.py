@@ -15,6 +15,7 @@ from src.reference_data import (
     PARTY_ID_PREFIXES, CITIES_BY_COUNTRY, CAPITALS, resolve_country_code,
 )
 from src.ambiguity_resolver import resolve_city_country_ambiguity
+from src.geonames.geonames_validator import validate_town_in_country
 
 # ✅ FIX: Suppression des espaces parasites dans les clés/valeurs
 SHORT_COUNTRY_TO_ISO = {
@@ -317,6 +318,37 @@ def _split_inline_name_address(line):
     if not left or not right: return raw, None
     return left, _norm(right)
 
+def _split_inline_address_town(line):
+    raw = _norm(line)
+    if "," not in raw:
+        return None, None, None
+
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if len(parts) < 2:
+        return None, None, None
+
+    town_candidate = _clean_town_value(parts[-1])
+    if not town_candidate:
+        return None, None, None
+
+    country_candidate = _known_city_country(town_candidate)
+    if not country_candidate:
+        for country_code in COUNTRY_CODES:
+            is_valid, canonical, _ = validate_town_in_country(country_code, town_candidate)
+            if is_valid and canonical:
+                country_candidate = country_code
+                town_candidate = _clean_town_value(canonical)
+                break
+
+    if not country_candidate:
+        return None, None, None
+
+    address_part = ", ".join(parts[:-1]).strip(" ,-/")
+    if not address_part:
+        return None, None, None
+
+    return _norm(address_part), town_candidate, country_candidate
+
 def _looks_like_org_continuation(line):
     up = _norm(line).upper()
     if _is_known_city(up) or _is_known_country_name(up) or _is_address(up): return False
@@ -486,6 +518,48 @@ def _extract_country_postal_town_fragment(line):
         town = _clean_town_value(_norm(m.group(2)))
         # Eviter que ça matche de faux numéros de rue (ex: 8846 RUE VALADE)
         if town and not _contains_address_keyword(town): return 0, len(raw), CountryTown(country=None, town=town, postal_code=m.group(1))
+
+
+
+    # 6. UK Postal Code: E14 5AB LONDON or LONDON E14 5AB
+    # Easiest way is to match postal code alone or with town
+    m = re.match(r"^([A-Z]{1,2}\d[A-Z\d]?)\s*(\d[A-Z]{2})\s+([A-Z][A-Z0-9()' .\-]+)$", raw, flags=re.IGNORECASE)
+    if m:
+        pc = m.group(1) + " " + m.group(2)
+        town = _clean_town_value(_norm(m.group(3)))
+        if town and not _contains_address_keyword(town): return 0, len(raw), CountryTown(country=None, town=town, postal_code=pc)
+
+    m = re.match(r"^([A-Z][A-Z0-9()' .\-]+)\s+([A-Z]{1,2}\d[A-Z\d]?)\s*(\d[A-Z]{2})$", raw, flags=re.IGNORECASE)
+    if m:
+        town = _clean_town_value(_norm(m.group(1)))
+        pc = m.group(2) + " " + m.group(3)
+        if town and not _contains_address_keyword(town): return 0, len(raw), CountryTown(country=None, town=town, postal_code=pc)
+        
+    m = re.match(r"^([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})$", raw, flags=re.IGNORECASE)
+    if m:
+        pc = _norm(m.group(1))
+        return 0, len(raw), CountryTown(country=None, town=None, postal_code=pc)
+
+
+
+    # 6. UK Postal Code: E14 5AB LONDON or LONDON E14 5AB
+    # Easiest way is to match postal code alone or with town
+    m = re.match(r"^([A-Z]{1,2}\d[A-Z\d]?)\s*(\d[A-Z]{2})\s+([A-Z][A-Z0-9()' .\-]+)$", raw, flags=re.IGNORECASE)
+    if m:
+        pc = m.group(1) + " " + m.group(2)
+        town = _clean_town_value(_norm(m.group(3)))
+        if town and not _contains_address_keyword(town): return 0, len(raw), CountryTown(country=None, town=town, postal_code=pc)
+
+    m = re.match(r"^([A-Z][A-Z0-9()' .\-]+)\s+([A-Z]{1,2}\d[A-Z\d]?)\s*(\d[A-Z]{2})$", raw, flags=re.IGNORECASE)
+    if m:
+        town = _clean_town_value(_norm(m.group(1)))
+        pc = m.group(2) + " " + m.group(3)
+        if town and not _contains_address_keyword(town): return 0, len(raw), CountryTown(country=None, town=town, postal_code=pc)
+        
+    m = re.match(r"^([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})$", raw, flags=re.IGNORECASE)
+    if m:
+        pc = _norm(m.group(1))
+        return 0, len(raw), CountryTown(country=None, town=None, postal_code=pc)
 
     return None
 def _apply_iban_and_capital_fallback(geo, iban_country, warnings):
@@ -657,6 +731,14 @@ def parse_free_party_field(pre, field_type, role, message_id):
 
     # 3. Extraction géographique
     geo, consumed = _extract_geo_from_free_lines(content, warnings)
+
+    if consumed == 1 and content:
+        inline_addr, inline_town, inline_country = _split_inline_address_town(content[-1])
+        if inline_addr and inline_town and inline_country:
+            geo = CountryTown(country=geo.country or inline_country, town=inline_town, postal_code=geo.postal_code)
+            warnings.append("inline_address_town_split")
+            content[-1] = inline_addr
+            consumed = 0
 
     # ✅ CORRECTION CRITIQUE : Ne consomme QUE les lignes strictement géographiques
     if consumed > 0 and content:
