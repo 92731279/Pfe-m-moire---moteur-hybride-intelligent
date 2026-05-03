@@ -108,9 +108,10 @@ def _resolve_town_from_composite(country: str, town_source: str) -> Optional[Tup
     if collapsed:
         tokens = collapsed.split()
         for size in range(min(3, len(tokens)), 0, -1):
-            candidate = " ".join(tokens[-size:])
-            if candidate and not re.search(r"\d", candidate):
-                parts.append(candidate)
+            for start in range(0, len(tokens) - size + 1):
+                candidate = " ".join(tokens[start:start + size])
+                if candidate and not re.search(r"\d", candidate):
+                    parts.append(candidate)
 
     seen = set()
     for candidate in parts:

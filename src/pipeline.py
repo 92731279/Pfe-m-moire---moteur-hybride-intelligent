@@ -96,6 +96,7 @@ def run_pipeline(
     message_id: str = "MSG_PIPELINE",
     slm_model: str = "qwen2.5:0.5b",
     logger: PipelineLogger = None,
+    disable_slm: bool = False,
 ):
     logger = logger or PipelineLogger()
 
@@ -161,8 +162,8 @@ def run_pipeline(
     )
 
     # E3 — SLM Fallback
-    use_slm = needs_slm_fallback(e2)
-    logger.log("E3", "Décision fallback SLM", use_slm=use_slm)
+    use_slm = needs_slm_fallback(e2) and not disable_slm
+    logger.log("E3", "Décision fallback SLM", use_slm=use_slm, disabled=disable_slm)
 
     if use_slm:
         logger.log("E3", "Appel SLM en cours", model=slm_model)
@@ -200,13 +201,33 @@ def run_pipeline(
             warnings=e2.meta.warnings,
         )
 
-    # --- GEO-KNOWLEDGE : Backfill prudent depuis le postal explicite uniquement ---
+    # --- GEO-KNOWLEDGE : Inférence standardisée internationale code postal → ville ---
     def _enrich_city_via_postal(party):
-        if not party.country_town: return party
+        """
+        Enrichissement robuste: inférer la ville depuis code postal + pays.
+        Standardisé pour TOUS les pays supportés via data/postal_mappings.json.
+        
+        Stratégie de fallback:
+        1. Dictionnaire postal_mappings.json (rapide, 20+ pays)
+        2. SLM fallback si dictionnaire échoue (plus lent, couvre tous les pays)
+        
+        Logique:
+        1. Si ville est présente, garder telle quelle
+        2. Si ville absente mais postal présent → inférer via mappings globaux
+        3. Si mappings échouent et SLM dispo → utiliser SLM fallback
+        4. Nettoyer les signaux de quarantaine si ville récupérée
+        """
+        if not party.country_town:
+            return party
+        
+        from src.geonames.geonames_db import infer_city_from_postal_code
+        from src.postal_slm_fallback import infer_city_via_slm_postal, needs_postal_slm_fallback
+        
         t = party.country_town.town
         p = party.country_town.postal_code
         c = party.country_town.country
         
+        # Récupérer postal code des fragments adresse si absent du country_town
         if not p and party.fragmented_addresses:
             for frag in party.fragmented_addresses:
                 if frag.pst_cd:
@@ -214,43 +235,33 @@ def run_pipeline(
                     party.country_town.postal_code = p
                     break
         
-        mapping_tn = {
-            "2037": "ENNASR / ARIANA", "1000": "TUNIS", "2080": "ARIANA",
-            "3000": "SFAX", "4000": "SOUSSE", "8000": "NABEUL",
-            "1073": "MONTPLAISIR", "1053": "LES BERGES DU LAC", "2000": "BARDO",
-            "2070": "LA MARSA", "2078": "LA MARSA", "5000": "MONASTIR",
-            "6000": "GABES", "4011": "HAMMAM SOUSSE", "2016": "CARTHAGE"
-        }
+        # Inférence postal → ville si conditions réunies
+        if c and p and (not t or str(t).strip() in ["", "NONE", "N/A", "N A", "NULL"]):
+            # Étape 1: Essayer le dictionnaire postal_mappings.json
+            inferred_town = infer_city_from_postal_code(c, p)
+            
+            # Étape 2: Si échec du dictionnaire, essayer SLM fallback
+            if not inferred_town and needs_postal_slm_fallback(c, p, t):
+                try:
+                    inferred_town = infer_city_via_slm_postal(c, p, model="phi3:mini")
+                    if inferred_town:
+                        if not party.meta.warnings:
+                            party.meta.warnings = []
+                        party.meta.warnings.append(f"geo_postal_inference_slm_{c}:{p}→{inferred_town}")
+                except Exception as e:
+                    logger.log("GEO", f"SLM postal fallback failed: {e}", level="WARN")
+            elif inferred_town:
+                # Dictionnaire réussit → ajouter warning standard
+                if not party.meta.warnings:
+                    party.meta.warnings = []
+                party.meta.warnings.append(f"geo_postal_inference_{c}:{p}→{inferred_town}")
+            
+            # Appliquer l'inférence si trouvée
+            if inferred_town:
+                party.country_town.town = inferred_town
+                t = inferred_town  # Mise à jour locale
         
-        # Mapping inversé pour déduire le code postal depuis la ville
-        reverse_mapping_tn = {
-            "TUNIS": "1000", "ARIANA": "2080", "ARYANAH": "2080", "SFAX": "3000", "SOUSSE": "4000", 
-            "NABEUL": "8000", "MONTPLAISIR": "1073", "LES BERGES DU LAC": "1053", 
-            "BARDO": "2000", "LA MARSA": "2070", "MONASTIR": "5000", 
-            "GABES": "6000", "HAMMAM SOUSSE": "4011", "CARTHAGE": "2016",
-            "SUKRAH": "2036", "LA SOUKRA": "2036", "SOUKRA": "2036"
-        }
-        
-        # Mapping inversé pour déduire le code postal depuis la ville
-        reverse_mapping_tn = {
-            "TUNIS": "1000", "ARIANA": "2080", "ARYANAH": "2080", "SFAX": "3000", "SOUSSE": "4000", 
-            "NABEUL": "8000", "MONTPLAISIR": "1073", "LES BERGES DU LAC": "1053", 
-            "BARDO": "2000", "LA MARSA": "2070", "MONASTIR": "5000", 
-            "GABES": "6000", "HAMMAM SOUSSE": "4011", "CARTHAGE": "2016",
-            "SUKRAH": "2036", "LA SOUKRA": "2036", "SOUKRA": "2036"
-        }
-        
-        if c == "TN" and p:
-            import re
-            clean_p = re.sub(r"[^\d]", "", str(p))
-            if clean_p in mapping_tn:
-                if not t or str(t).strip() == "" or str(t).lower() == "none":
-                    party.country_town.town = mapping_tn[clean_p]
-                    if not party.meta.warnings: party.meta.warnings = []
-                    party.meta.warnings.append(f"geo_postal_resolution_{clean_p}")
-                    t = party.country_town.town # Mise à jour locale
-        
-        # 🧹 CLEANUP FINAL AVANT RETOUR: Si la ville est connue, on vire TOUT 'requires_manual_verification:town_unverified'
+        # 🧹 CLEANUP FINAL: Si la ville est désormais connue, nettoyer les signaux de quarantaine
         if party.country_town and party.country_town.town and str(party.country_town.town).strip().upper() not in ["", "N A", "N/A", "NULL", "NONE"]:
             party.meta.warnings[:] = [w for w in party.meta.warnings if "requires_manual_verification:town_unverified" not in str(w)]
             party.meta.warnings[:] = [w for w in party.meta.warnings if "pass1_town_ambiguous_requires_disambiguation" not in str(w)]
@@ -268,6 +279,21 @@ def run_pipeline(
 
 
     logger.log("OUTPUT", "Pipeline terminé")
+
+    # POINT D: Audit Trail & "Human Verification Flag"
+    # Lève un flag d'alerte métier pour aiguillage manuel si des doutes ou des avertissements persistent
+    if e2.meta.warnings:
+        critical_warnings = [
+            "requires_manual_verification", 
+            "pass1_town_ambiguous", 
+            "pass1_country_missing"
+        ]
+        if any(cw in w for cw in critical_warnings for w in e2.meta.warnings):
+            e2.meta.requires_manual_review = True
+            
+    # Autre cas de review manuel : L'IA a été appelée mais sa confiance globale est moyenne (< 0.8)
+    if e2.meta.fallback_used and e2.meta.parse_confidence < 0.8:
+        e2.meta.requires_manual_review = True
 
     # 🧹 CLEANUP POST-IA pour 50F/59F: Retirer les tags "1/", "2/", "3/" réinjectés par erreur
     if getattr(e2.meta, "detected_field_type", "") in ["50F", "59F"] or getattr(e0.meta, "detected_field_type", "") in ["50F", "59F"]:

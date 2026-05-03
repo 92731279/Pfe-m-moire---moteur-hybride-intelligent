@@ -63,6 +63,9 @@ class CanonicalMeta(BaseModel):
     fallback_used: bool = False
     rejected: bool = False
     rejection_reasons: List[str] = Field(default_factory=list)
+    
+    # 🔹 POINT D : Audit Trail & Fiabilité en Production
+    requires_manual_review: bool = False
 
 
 class CanonicalParty(BaseModel):

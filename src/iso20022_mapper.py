@@ -318,26 +318,63 @@ def _build_postal_address(party: CanonicalParty) -> Dict[str, Any]:
     )
     if _is_redundant_locality(inferred_locality, canonical_town, ctry_sub_div, pst_cd):
         inferred_locality = None
-
-    postal_address: Dict[str, Any] = {
-        "AdrTp": None,
-        "Dept": None,
-        "SubDept": None,
-        "StrtNm": strt_nm,
-        "BldgNb": bldg_nb,
-        "BldgNm": bldg_nm,
-        "Flr": flr,
-        "PstBx": pst_bx,
-        "Room": room,
-        "PstCd": pst_cd,
-        "TwnNm": canonical_town,
-        "TwnLctnNm": inferred_locality,
-        "DstrctNm": None,
-        "CtrySubDvsn": ctry_sub_div,
-        "Ctry": ctry,
-        "AdrLine": filtered_address_lines,
-    }
-
+        
+    # --- SR2025 HYBRID ADDRESS COMPLIANCE ---
+    is_valid_hybrid = bool(canonical_town and ctry)
+    
+    if is_valid_hybrid:
+        # Enforce max 2 AdrLine for Hybrid
+        if len(filtered_address_lines) > 2:
+            # Concatenate lines keeping max 70 chars per line (SWIFT typical limit)
+            cmb = " ".join(filtered_address_lines)
+            if len(cmb) <= 70:
+                filtered_address_lines = [cmb]
+            else:
+                filtered_address_lines = [cmb[:70].strip(), cmb[70:140].strip()]
+        
+        postal_address: Dict[str, Any] = {
+            "AdrTp": None,
+            "Dept": None,
+            "SubDept": None,
+            "StrtNm": strt_nm,
+            "BldgNb": bldg_nb,
+            "BldgNm": bldg_nm,
+            "Flr": flr,
+            "PstBx": pst_bx,
+            "Room": room,
+            "PstCd": pst_cd,
+            "TwnNm": canonical_town,
+            "TwnLctnNm": inferred_locality,
+            "DstrctNm": None,
+            "CtrySubDvsn": ctry_sub_div,
+            "Ctry": ctry,
+            "AdrLine": [line for line in filtered_address_lines if line],
+        }
+    else:
+        # Graceful degradation to Unstructured Address if minimum requirements are not met
+        original_lines = _clean_list(party.address_lines)
+        if postal_complement and postal_complement not in original_lines:
+            original_lines.append(postal_complement)
+            
+        postal_address: Dict[str, Any] = {
+            "AdrTp": None,
+            "Dept": None,
+            "SubDept": None,
+            "StrtNm": None,
+            "BldgNb": None,
+            "BldgNm": None,
+            "Flr": None,
+            "PstBx": None,
+            "Room": None,
+            "PstCd": None,
+            "TwnNm": None,
+            "TwnLctnNm": None,
+            "DstrctNm": None,
+            "CtrySubDvsn": None,
+            "Ctry": ctry,  # Country is usually allowed even in unstructured context depending on schema, but let's keep it safe. ISO 20022 allows Ctry + AdrLine.
+            "AdrLine": original_lines[:3],  # Typically 3 lines max for purely unstructured PstlAdr in NameAndAddress
+        }
+        
     return {key: value for key, value in postal_address.items() if value not in (None, [], "")}
 
 

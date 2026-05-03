@@ -1,15 +1,39 @@
 """geonames_db.py — Accès à la base GeoNames SQLite"""
 
 import sqlite3
+import json
+import re
 from pathlib import Path
 from typing import Optional
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 DB_PATH = BASE_DIR / "data" / "geonames" / "db" / "geonames.sqlite"
+POSTAL_MAPPINGS_PATH = BASE_DIR / "data" / "postal_mappings.json"
 
 # feature_class acceptés pour les villes/zones habitées
 VALID_FEATURE_CLASSES = ("'P'", "'A'")
 VALID_FC_SQL = "feature_class IN ('P', 'A')"
+
+# Cache des mappings postaux chargés au démarrage
+_POSTAL_MAPPINGS = None
+
+def _load_postal_mappings():
+    """Charge les mappings code postal -> ville depuis le fichier JSON"""
+    global _POSTAL_MAPPINGS
+    if _POSTAL_MAPPINGS is not None:
+        return _POSTAL_MAPPINGS
+    
+    _POSTAL_MAPPINGS = {}
+    if not POSTAL_MAPPINGS_PATH.exists():
+        return _POSTAL_MAPPINGS
+    
+    try:
+        with open(POSTAL_MAPPINGS_PATH, 'r', encoding='utf-8') as f:
+            _POSTAL_MAPPINGS = json.load(f)
+    except Exception as e:
+        print(f"⚠️  Erreur chargement postal_mappings.json: {e}")
+    
+    return _POSTAL_MAPPINGS
 
 
 def _connect():
@@ -288,3 +312,168 @@ def get_parent_city_for_district(country_code: str, locality_name: str) -> Optio
         finally:
             conn.close()
     return None
+
+
+def infer_city_from_postal_code(country_code: str, postal_code: str) -> Optional[str]:
+    """
+    Inférence générique internationale : Code Postal + Pays → Ville
+    
+    Essaie successivement:
+    1. Recherche exacte dans les mappings postaux (data/postal_mappings.json)
+    2. Recherche préfixe (utile pour UK où E14 5AB → E14 correspond à LONDON)
+    3. Nettoyage et recherche sans espaces/tirets
+    
+    Retourne le nom de la ville canonique si trouvée, None sinon.
+    
+    Exemples:
+    - infer_city_from_postal_code("TN", "1000") → "TUNIS"
+    - infer_city_from_postal_code("FR", "75001") → "PARIS"
+    - infer_city_from_postal_code("GB", "E14 5AB") → "LONDON"
+    - infer_city_from_postal_code("DE", "10115") → "BERLIN"
+    """
+    if not country_code or not postal_code:
+        return None
+    
+    country_code = country_code.upper().strip()
+    postal_code = postal_code.strip()
+    
+    mappings = _load_postal_mappings()
+    if country_code not in mappings:
+        return None
+    
+    country_data = mappings[country_code]
+    
+    # 1. Recherche exacte
+    if postal_code in country_data:
+        return country_data[postal_code]
+    
+    # 2. Recherche préfixe (pour systèmes postaux qui n'ont pas exactement le même format)
+    # Exemple: UK "E14 5AB" → chercher "E14"
+    postal_normalized = re.sub(r"[\s\-]", "", postal_code)
+    if postal_normalized in country_data:
+        return country_data[postal_normalized]
+    
+    # 3. Chercher par préfixe (les N premiers caractères)
+    # Utile pour pays où les N premiers chiffres définissent la région/ville
+    for prefix_len in [5, 4, 3, 2]:
+        if len(postal_code) >= prefix_len:
+            prefix = postal_normalized[:prefix_len]
+            if prefix in country_data:
+                return country_data[prefix]
+    
+    return None
+
+
+def resolve_postal_or_town(country_code: str, postal_code: Optional[str], town_name: Optional[str]) -> Optional[str]:
+    """
+    Résout une localité robustement en faveur de la preuve explicite (town) avec fallback postal.
+    
+    Priorités:
+    1. Si town est présent et valide en GeoNames → retourne town validée
+    2. Si town manque mais postal présent → inférer town depuis postal
+    3. Sinon → retour None
+    
+    Retourne (town_validé, matched_via):
+    - "geonames_explicit" si town trouvée en GeoNames
+    - "postal_inference" si inférée depuis code postal
+    - None si impossible
+    """
+    # Cas 1: town explicite
+    if town_name:
+        result = find_place(country_code, town_name)
+        if result:
+            return result["name"], "geonames_explicit"
+        
+        result = find_alternate_place(country_code, town_name)
+        if result:
+            return result["name"], "geonames_explicit"
+    
+    # Cas 2: town manque, essayer inférence depuis postal
+    if postal_code and not town_name:
+        inferred_town = infer_city_from_postal_code(country_code, postal_code)
+        if inferred_town:
+            return inferred_town, "postal_inference"
+    
+    return None, None
+
+
+def find_major_cities_by_country(country_code: str, limit: int = 10) -> list:
+    """
+    Retourne les villes principales d'un pays, triées par population.
+    
+    Utilisé par le fallback SLM pour avoir des candidats possibles
+    quand le dictionnaire postal_mappings.json n'a pas la réponse.
+    
+    Exemple:
+    - find_major_cities_by_country("TN") → [
+        {"name": "TUNIS", "population": 728453},
+        {"name": "SFAX", "population": 367948},
+        ...
+      ]
+    """
+    if not country_code:
+        return []
+    
+    country_code = country_code.upper().strip()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"""
+            SELECT name, population, feature_class, feature_code, admin1_code
+            FROM geonames_places
+            WHERE country_code = ?
+              AND feature_class = 'P'
+            ORDER BY population DESC
+            LIMIT ?
+        """, (country_code, limit))
+        
+        results = []
+        for row in cur.fetchall():
+            results.append({
+                "name": row[0],
+                "population": row[1],
+                "feature_class": row[2],
+                "feature_code": row[3],
+                "admin1_code": row[4],
+            })
+        return results
+    finally:
+        conn.close()
+
+
+def infer_city_with_slm_candidate_info(country_code: str, postal_code: str) -> dict:
+    """
+    Prépare les données pour un fallback SLM.
+    
+    Retourne un dict avec:
+    - postal_code: le code postal
+    - country_code: le code pays
+    - major_cities: les villes principales du pays (pour contexte LLM)
+    - context: information contextuelle pour le prompt SLM
+    
+    Utilisé quand infer_city_from_postal_code() retourne None.
+    
+    Exemple:
+    {
+        "postal_code": "8000",
+        "country_code": "TN",
+        "major_cities": [{"name": "TUNIS", "population": ...}, ...],
+        "context": "Postal code 8000 in Tunisia. Candidates: NABEUL, SFAX, ..."
+    }
+    """
+    if not country_code or not postal_code:
+        return {}
+    
+    country_code = country_code.upper().strip()
+    major_cities = find_major_cities_by_country(country_code, limit=15)
+    
+    city_names = [city["name"] for city in major_cities]
+    context = f"Postal code {postal_code} in {country_code}. Candidate cities: {', '.join(city_names[:5])}"
+    
+    return {
+        "postal_code": postal_code,
+        "country_code": country_code,
+        "major_cities": major_cities,
+        "context": context,
+    }
+

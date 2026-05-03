@@ -1151,14 +1151,6 @@ with st.sidebar:
         [
             "🚀 Mode Avancé",
             "✅ Mode Validation",
-            "📐 Architecture",
-            "🎬 Démo Guidée",
-            "🧠 Avant/Après SLM",
-            "🔎 Explainability",
-            "📊 KPI Dashboard",
-            "🧪 Comparateur Multi-cas",
-            "📦 Export Pro",
-            "🗂️ Banque de Cas",
         ],
         label_visibility="collapsed"
     )

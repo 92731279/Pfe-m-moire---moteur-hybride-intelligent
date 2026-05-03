@@ -1,0 +1,164 @@
+{
+  "TN": {
+    "1000": "TUNIS",
+    "1001": "TUNIS",
+    "1002": "TUNIS",
+    "1003": "TUNIS",
+    "1004": "TUNIS",
+    "1005": "TUNIS",
+    "1006": "TUNIS",
+    "1053": "LES BERGES DU LAC",
+    "1073": "MONTPLAISIR",
+    "2000": "BARDO",
+    "2016": "CARTHAGE",
+    "2037": "ENNASR / ARIANA",
+    "2070": "LA MARSA",
+    "2078": "LA MARSA",
+    "2080": "ARIANA",
+    "3000": "SFAX",
+    "4000": "SOUSSE",
+    "4011": "HAMMAM SOUSSE",
+    "5000": "MONASTIR",
+    "6000": "GABES",
+    "8000": "NABEUL"
+  },
+  "FR": {
+    "75001": "PARIS",
+    "75002": "PARIS",
+    "75003": "PARIS",
+    "75004": "PARIS",
+    "75005": "PARIS",
+    "75006": "PARIS",
+    "75007": "PARIS",
+    "75008": "PARIS",
+    "75009": "PARIS",
+    "75010": "PARIS",
+    "75011": "PARIS",
+    "75012": "PARIS",
+    "75013": "PARIS",
+    "75014": "PARIS",
+    "75015": "PARIS",
+    "75016": "PARIS",
+    "75017": "PARIS",
+    "75018": "PARIS",
+    "75019": "PARIS",
+    "75020": "PARIS",
+    "13000": "MARSEILLE",
+    "69000": "LYON",
+    "33000": "BORDEAUX",
+    "31000": "TOULOUSE"
+  },
+  "US": {
+    "10001": "NEW YORK",
+    "10002": "NEW YORK",
+    "10003": "NEW YORK",
+    "10004": "NEW YORK",
+    "10005": "NEW YORK",
+    "10006": "NEW YORK",
+    "10007": "NEW YORK",
+    "10008": "NEW YORK",
+    "10009": "NEW YORK",
+    "10010": "NEW YORK",
+    "33132": "MIAMI",
+    "90001": "LOS ANGELES",
+    "60601": "CHICAGO",
+    "77001": "HOUSTON",
+    "85001": "PHOENIX"
+  },
+  "GB": {
+    "E1": "LONDON",
+    "E14": "LONDON",
+    "SW1A": "LONDON",
+    "SW1B": "LONDON",
+    "SW1E": "LONDON",
+    "SW1H": "LONDON",
+    "SW1P": "LONDON",
+    "SW1V": "LONDON",
+    "SW1W": "LONDON",
+    "W1A": "LONDON",
+    "W1B": "LONDON",
+    "W1C": "LONDON",
+    "W1D": "LONDON",
+    "W1E": "LONDON",
+    "W1F": "LONDON",
+    "W1G": "LONDON",
+    "W1H": "LONDON",
+    "W1J": "LONDON",
+    "W1K": "LONDON",
+    "WC1A": "LONDON",
+    "WC2A": "LONDON"
+  },
+  "DE": {
+    "10115": "BERLIN",
+    "10117": "BERLIN",
+    "10119": "BERLIN",
+    "65929": "FRANKFURT",
+    "81929": "MUNICH",
+    "80001": "MUNICH",
+    "50667": "COLOGNE"
+  },
+  "ES": {
+    "28001": "MADRID",
+    "28002": "MADRID",
+    "08002": "BARCELONA",
+    "08003": "BARCELONA"
+  },
+  "IT": {
+    "00100": "ROME",
+    "20100": "MILAN",
+    "80100": "NAPLES"
+  },
+  "CH": {
+    "8001": "ZURICH",
+    "8004": "ZURICH",
+    "1200": "GENEVA",
+    "6900": "LUGANO"
+  },
+  "AE": {
+    "00000": "DUBAI",
+    "00001": "DUBAI",
+    "00002": "ABU DHABI"
+  },
+  "SA": {
+    "11111": "RIYADH",
+    "11112": "RIYADH",
+    "21111": "JEDDAH"
+  },
+  "CN": {
+    "100000": "BEIJING",
+    "200000": "SHANGHAI",
+    "510000": "GUANGZHOU",
+    "510100": "GUANGZHOU",
+    "430000": "WUHAN"
+  },
+  "JP": {
+    "100-0001": "TOKYO",
+    "100-0002": "TOKYO",
+    "600-0000": "KYOTO",
+    "530-0000": "OSAKA",
+    "730-0000": "HIROSHIMA"
+  },
+  "IN": {
+    "110001": "NEW DELHI",
+    "400001": "MUMBAI",
+    "560001": "BANGALORE",
+    "700001": "KOLKATA"
+  },
+  "BR": {
+    "01310-100": "SAO PAULO",
+    "20040020": "RIO DE JANEIRO",
+    "30130100": "BELO HORIZONTE"
+  },
+  "CA": {
+    "M5H 2N2": "TORONTO",
+    "M5H 2N3": "TORONTO",
+    "V6B 2R3": "VANCOUVER",
+    "H1A 1A1": "MONTREAL"
+  },
+  "AU": {
+    "2000": "SYDNEY",
+    "2010": "SYDNEY",
+    "3000": "MELBOURNE",
+    "4000": "BRISBANE"
+  }
+}

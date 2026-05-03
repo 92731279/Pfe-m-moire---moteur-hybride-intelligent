@@ -11,9 +11,10 @@ import hashlib
 import time
 from typing import Optional, Dict, Any, List
 import requests
-from src.config import OLLAMA_BASE_URL, OLLAMA_TIMEOUT_SECONDS, OLLAMA_MAX_RETRIES
+from src.config import OLLAMA_BASE_URL, OLLAMA_TIMEOUT_SECONDS, OLLAMA_MAX_RETRIES, get_ollama_base_urls
 from src.models import CanonicalParty, CountryTown
 from src.reference_data import resolve_country_code
+from src.slm_validation import validate_slm_town
 
 logger = logging.getLogger(__name__)
 
@@ -308,13 +309,26 @@ class E3SLMFallback:
     
     def _needs_fallback(self, party: CanonicalParty) -> bool:
         """
-        Détermine si le fallback SLM est nécessaire.
+        Détermine si le fallback SLM est nécessaire via Smart Routing.
         """
         confidence = _meta_get(party.meta, 'parse_confidence', 0)
         warnings = _meta_get(party.meta, 'warnings', [])
         
         if _is_simple_country_only_gap(party, warnings):
             return False
+            
+        # Point B : Smart Routing - Heuristique de complexité préemptive
+        # Si la confiance initiale est très basse (<0.3) et l'adresse n'a aucun composant structuré identifié,
+        # ou qu'il y a plus de 5 mots-clés d'adresse distincts échoués, c'est un cas complexe massif.
+        raw_text_len = len(str(party.raw)) if party.raw else 0
+        fragments = getattr(party, "fragmented_addresses", [])
+        
+        # Si trop long / sans structure evidente => Fallback acceleré (pas besoin de d'insister en heuristique)
+        is_highly_complex = confidence < 0.4 and (raw_text_len > 120 or not fragments)
+        if is_highly_complex:
+            if getattr(party.meta, "llm_signals", None) is not None:
+                party.meta.llm_signals.append("fast_track_slm_triggered_due_to_complexity")
+            return True
         
         # Liste des warnings qui justifient un fallback
         fallback_triggers = [
@@ -372,31 +386,43 @@ class E3SLMFallback:
             }
         }
         
+        endpoint_candidates = list(get_ollama_base_urls())
+        if self.ollama_url and self.ollama_url not in endpoint_candidates:
+            endpoint_candidates.insert(0, self.ollama_url.rstrip("/"))
+
         for attempt in range(self.max_retries):
             try:
                 start_time = time.time()
-                response = requests.post(
-                    f"{self.ollama_url}/api/generate",
-                    json=payload,
-                    timeout=(3, self.timeout)
-                )
-                elapsed = time.time() - start_time
-                
-                if response.status_code == 200:
-                    result_text = response.json().get("response", "").strip()
-                    logger.info(f"[E3] SLM réponse en {elapsed:.1f}s")
-                    _ollama_circuit_breaker.record_success()  # Réinitialiser le circuit breaker
-                    return self._parse_slm_response(result_text)
-                else:
-                    logger.warning(f"[E3] HTTP {response.status_code} (tentative {attempt + 1}/{self.max_retries})")
-                    _ollama_circuit_breaker.record_failure()
-                    
-                    # Réduire le prompt pour la retry en cas d'erreur
-                    if attempt < self.max_retries - 1:
-                        payload["options"]["num_predict"] = max(60, payload["options"]["num_predict"] - 30)
-                        wait_time = min(5, (attempt + 1) * 2)  # Backoff exponentiel: 2s, 4s, 6s...
-                        logger.debug(f"[E3] Attente {wait_time}s avant retry...")
-                        time.sleep(wait_time)
+                last_error = None
+                for base_url in endpoint_candidates:
+                    try:
+                        response = requests.post(
+                            f"{base_url}/api/generate",
+                            json=payload,
+                            timeout=(3, self.timeout)
+                        )
+                        elapsed = time.time() - start_time
+
+                        if response.status_code == 200:
+                            result_text = response.json().get("response", "").strip()
+                            logger.info(f"[E3] SLM réponse en {elapsed:.1f}s via {base_url}")
+                            _ollama_circuit_breaker.record_success()
+                            return self._parse_slm_response(result_text)
+
+                        last_error = f"HTTP {response.status_code} via {base_url}"
+                        logger.warning(f"[E3] {last_error} (tentative {attempt + 1}/{self.max_retries})")
+                    except requests.ConnectionError as e:
+                        last_error = f"Connection error via {base_url}: {e}"
+                        logger.warning(f"[E3] {last_error}")
+                        continue
+
+                _ollama_circuit_breaker.record_failure()
+
+                if attempt < self.max_retries - 1:
+                    payload["options"]["num_predict"] = max(60, payload["options"]["num_predict"] - 30)
+                    wait_time = min(5, (attempt + 1) * 2)  # Backoff exponentiel: 2s, 4s, 6s...
+                    logger.debug(f"[E3] Attente {wait_time}s avant retry... ({last_error})")
+                    time.sleep(wait_time)
                     
             except requests.Timeout:
                 logger.warning(
@@ -411,11 +437,6 @@ class E3SLMFallback:
                     logger.debug(f"[E3] Attente {wait_time}s avant retry...")
                     time.sleep(wait_time)
                     
-            except requests.ConnectionError as e:
-                logger.error(f"[E3] Connection error: {e}")
-                _ollama_circuit_breaker.record_failure()
-                break
-                
             except Exception as e:
                 logger.error(f"[E3] Erreur inattendue: {type(e).__name__}: {e}")
                 _ollama_circuit_breaker.record_failure()
@@ -452,13 +473,15 @@ RÈGLES STRICTES:
 3. town = ville SEULE (PAS adresse, PAS pays, PAS postal).
 4. country = code ISO 2 lettres obligatoirement (ex: TN, FR).
 5. postal = code postal ou - si absent.
+6. confidence = VOS certitudes de 0.0 à 1.0 (ex: 0.95).
 
-FORMAT RÉPONSE (5 lignes):
+FORMAT RÉPONSE (6 lignes):
 name: <valeur>
 address: <valeur ou ->
 town: <valeur>
 country: <XX>
 postal: <valeur ou ->
+confidence: <0.0 to 1.0>
 
 EXEMPLES:
 
@@ -469,9 +492,16 @@ address: RUE DE LA PAIX
 town: PARIS
 country: FR
 postal: -
+confidence: 0.95
 
 Input: "/TN4839\n2037 ARIANA\nZ.I. CHOTRANA 2\nSOCIETE MEUBLATEX SA\nATTN DIR FINANCIER"
 Output:
+name: SOCIETE MEUBLATEX SA
+address: Z.I. CHOTRANA 2\nATTN DIR FINANCIER
+town: ARIANA
+country: TN
+postal: 2037
+confidence: 0.85
 name: SOCIETE MEUBLATEX SA ATTN DIR FINANCIER
 address: Z.I. CHOTRANA 2
 town: ARIANA
@@ -511,7 +541,8 @@ Output:"""
             'address_lines': [],
             'town': None,
             'country': None,
-            'postal_code': None
+            'postal_code': None,
+            'confidence': 1.0 # default fallback
         }
         
         lines = response.strip().split('\n')
@@ -539,6 +570,14 @@ Output:"""
                     # Force correct if the LLM is stubborn
                     if country in ['TU', 'AT', 'CH']:
                         country = 'TN'
+                    result['country'] = country
+                elif key == 'postal':
+                    result['postal_code'] = value.upper()
+                elif key == 'confidence':
+                    try:
+                        result['confidence'] = float(value)
+                    except ValueError:
+                        pass
                     if len(country) == 2 and country.isalpha():
                         result['country'] = country
                 elif key == 'postal':
@@ -591,34 +630,24 @@ Output:"""
                 updated = True
                 logger.debug(f"[E3] Nom mis à jour: {slm_name}")
         
-        # 2. Adresse (ajouter si manquante)
-        sanitized_addresses = [line for line in slm_result.get('address_lines', []) 
-                            if not _contains_account_text(line, party.account)]
-                            
-        # ✅ REDONDANCE : Nettoyer la ville, le code postal et le pays des lignes d'adresse
-        clean_address_lines = []
-        for line in sanitized_addresses:
-            c_line = line
-            if slm_result.get('town') and str(slm_result['town']).upper() in c_line.upper():
-                c_line = re.compile(re.escape(str(slm_result['town'])), re.IGNORECASE).sub('', c_line)
-            if slm_result.get('postal') and str(slm_result['postal']) in c_line:
-                c_line = c_line.replace(str(slm_result['postal']), '')
-            if slm_result.get('country') and str(slm_result['country']).upper() in c_line.upper():
-                c_line = re.compile(re.escape(str(slm_result['country'])), re.IGNORECASE).sub('', c_line)
-            # Retirer aussi les mots comme "TUNISIE" si present
-            c_line = re.compile(r'\b(?:TUNISIE|TUNISIA|TUN|TU)\b', re.IGNORECASE).sub('', c_line)
-            
-            c_line = c_line.strip(',.- ')
-            # Retirer les espaces multiples cachés (regex)
-            c_line = re.sub(r'\s{2,}', ' ', c_line).strip()
-            c_line = _restore_unit_identifier(c_line, party.raw or party.account)
-            
-            if len(c_line) > 1:
-                clean_address_lines.append(c_line)
+        # 2. Adresse
+        # Ne jamais écraser le texte d'entrée: on conserve les address_lines d'origine
+        # pour éviter de perdre des mots saisis par l'utilisateur.
+        # Le SLM peut être utilisé pour backfill seulement si l'entrée n'avait aucune adresse.
+        if not party.address_lines:
+            sanitized_addresses = [line for line in slm_result.get('address_lines', [])
+                                if not _contains_account_text(line, party.account)]
+            clean_address_lines = []
+            for line in sanitized_addresses:
+                c_line = line
+                c_line = _restore_unit_identifier(c_line, party.raw or party.account)
+                if len(c_line) > 1:
+                    clean_address_lines.append(c_line)
 
-        party.address_lines = clean_address_lines
-        updated = True
-        logger.debug(f"[E3] Adresse mise à jour et nettoyée: {clean_address_lines}")
+            if clean_address_lines:
+                party.address_lines = clean_address_lines
+                updated = True
+                logger.debug(f"[E3] Adresse backfillée par SLM: {clean_address_lines}")
         
         # 3. Pays (priorité si manquant ou différent de l'IBAN)
         if slm_result.get('country'):
@@ -642,19 +671,36 @@ Output:"""
         if slm_result.get('town'):
             current_town = party.country_town.town if party.country_town else ''
             slm_town = slm_result['town']
+            validated_town, validation_reason = validate_slm_town(
+                party.country_town.country if party.country_town else None,
+                slm_town,
+                party.country_town.postal_code if party.country_town else None,
+            )
+
+            if not validated_town:
+                logger.warning(
+                    f"[E3] Ville SLM rejetée par validation backend: {slm_town} ({validation_reason})"
+                )
+                _meta_set(party.meta, 'warnings', list(_meta_get(party.meta, 'warnings', [])) + [
+                    f"slm_town_rejected_backend_validation:{validation_reason}"
+                ])
+                slm_result['town'] = None
+            else:
+                slm_town = validated_town
+                slm_result['town'] = validated_town
             
             # Prendre le SLM si la ville actuelle contient des mots d'adresse ou est fausse
             address_keywords = ['PO BOX', 'RUE', 'STREET', 'AVENUE', 'DEPT', 'DEPARTMENT']
             has_address_words = bool(current_town) and any(kw in current_town for kw in address_keywords)
             
             # Priorité absolue au SLM pour corriger les villes
-            if not current_town or current_town == "UNKNOWN" or has_address_words or len(slm_town) >= 3:
+            if validated_town and (not current_town or current_town == "UNKNOWN" or has_address_words or len(slm_town) >= 3):
                 if not party.country_town:
                     party.country_town = CountryTown(country=None, town=slm_town, postal_code=None)
                 else:
                     party.country_town.town = slm_town
                 updated = True
-                logger.debug(f"[E3] Ville mise à jour par SLM: {slm_town}")
+                logger.debug(f"[E3] Ville mise à jour par SLM: {slm_town} ({validation_reason})")
         
         # 5. Code postal
         if slm_result.get('postal_code'):
@@ -665,6 +711,10 @@ Output:"""
         # Mise à jour des métadonnées
         _meta_set(party.meta, 'llm_signals', ['slm_applied'])
         _meta_set(party.meta, 'fallback_used', True)
+        if slm_result.get('confidence'):
+            # Mix with actual confidence? Or just replace ? Since it's fallback let's put what SLM thinks.
+            # Convert if necessary
+            _meta_set(party.meta, 'parse_confidence', float(slm_result['confidence']))
 
         if updated:
             # Augmenter légèrement la confiance si SLM a amélioré

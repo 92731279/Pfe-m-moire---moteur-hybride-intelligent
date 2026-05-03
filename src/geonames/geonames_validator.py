@@ -118,6 +118,11 @@ def _generate_variants(town: str) -> list:
     if no_accent != town:
         variants.append(no_accent)
 
+    # Variantes collées fréquentes dans les toponymes maghrébins:
+    # ELHAOUARIA -> EL HAOUARIA
+    if t.startswith("EL") and not t.startswith("EL ") and len(t) > 3:
+        variants.append("EL " + t[2:])
+
     # --- Tirets vs espaces ---
     variants.append(t.replace("-", " "))
     variants.append(t.replace(" ", "-"))

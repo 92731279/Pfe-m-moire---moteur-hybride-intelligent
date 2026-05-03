@@ -415,6 +415,11 @@ def _extract_postal_marker(line):
     if m:
         return _norm(m.group(1)).replace(" ", "")
 
+    # Ne pas capturer les lignes à 3+ tokens comme "LONDON EC3N 3DS" ou "TN ELHAOUARIA 8045".
+    # On réserve ce fallback aux lignes très courtes où le code postal est seul ou quasi seul.
+    if len(raw.split()) > 2:
+        return None
+
     # Postal isolated after a marker-like prefix, including scripts without spaces.
     for prefix in ("邮编", "郵編", "〒", "우편번호", "ZIP", "POSTCODE", "POSTAL CODE", "CODE POSTAL", "CP", "PLZ", "CEP", "PINCODE", "INDEX", "ПОЧТОВЫЙ ИНДЕКС", "CODICE POSTALE", "CÓDIGO POSTAL", "CODIGO POSTAL", "الرمز البريدي", "رمز بريدي"):
         if raw.upper().startswith(prefix.upper()):
@@ -502,6 +507,15 @@ def _extract_country_postal_town_fragment(line):
             pc = m.group(3)                            # G3 est le postal
             if town: return m.start(), m.end(), CountryTown(country=cc, town=town, postal_code=pc)
 
+    # 3b. 🇺🇸 Format VILLE ÉTAT POSTAL (ex: CASTLE PINES CO 80108)
+    m = re.search(r"^([A-Z][A-Z0-9()' .\-]+?)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$", raw, flags=re.IGNORECASE)
+    if m:
+        town = _clean_town_value(_norm(m.group(1)))
+        state = m.group(2).upper()
+        postal = m.group(3).strip()
+        if town and state and postal:
+            return m.start(), m.end(), CountryTown(country="US", town=town, postal_code=postal)
+
     # 4. Format VILLE PROVINCE POSTAL PAYS (ex: QUEBEC QC G1G6L5 CA ou QUEBEC QC G1G 6L5 CA)
     # Match: (Ville et mots) (2 lettres province/état optionnel) (Code postal CA ou standard) (CA/US)
     m = re.search(r"^([A-Z][A-Z0-9()' .\-]+?)\s+(?:[A-Z]{2}\s+)?([A-Z0-9][A-Z0-9\- ]{2,8})\s+(CA|US)$", raw, flags=re.IGNORECASE)
@@ -511,6 +525,14 @@ def _extract_country_postal_town_fragment(line):
             town = _clean_town_value(_norm(m.group(1)))
             pc = _norm(m.group(2)).replace(" ", "")
             if town: return m.start(), m.end(), CountryTown(country=cc, town=town, postal_code=pc)
+
+    # 4b. 🇬🇧 Format VILLE POSTAL UK (ex: LONDON EC3N 3DS)
+    m = re.search(r"^([A-Z][A-Z0-9()' .\-]+?)\s+([A-Z]{1,2}\d[A-Z\d]?)\s*(\d[A-Z]{2})$", raw, flags=re.IGNORECASE)
+    if m:
+        town = _clean_town_value(_norm(m.group(1)))
+        pc = (m.group(2) + " " + m.group(3)).upper().strip()
+        if town and not _contains_address_keyword(town):
+            return m.start(), m.end(), CountryTown(country="GB", town=town, postal_code=pc)
 
     # 5. Postal seul: 38100 GRENOBLE
     m = re.match(r"^(\d{4,6})\s+([A-Z][A-Z0-9()' .\-]+)$", raw, flags=re.IGNORECASE)
@@ -527,18 +549,18 @@ def _extract_country_postal_town_fragment(line):
     if m:
         pc = m.group(1) + " " + m.group(2)
         town = _clean_town_value(_norm(m.group(3)))
-        if town and not _contains_address_keyword(town): return 0, len(raw), CountryTown(country=None, town=town, postal_code=pc)
+        if town and not _contains_address_keyword(town): return 0, len(raw), CountryTown(country="GB", town=town, postal_code=pc)
 
     m = re.match(r"^([A-Z][A-Z0-9()' .\-]+)\s+([A-Z]{1,2}\d[A-Z\d]?)\s*(\d[A-Z]{2})$", raw, flags=re.IGNORECASE)
     if m:
         town = _clean_town_value(_norm(m.group(1)))
         pc = m.group(2) + " " + m.group(3)
-        if town and not _contains_address_keyword(town): return 0, len(raw), CountryTown(country=None, town=town, postal_code=pc)
+        if town and not _contains_address_keyword(town): return 0, len(raw), CountryTown(country="GB", town=town, postal_code=pc)
         
     m = re.match(r"^([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})$", raw, flags=re.IGNORECASE)
     if m:
         pc = _norm(m.group(1))
-        return 0, len(raw), CountryTown(country=None, town=None, postal_code=pc)
+        return 0, len(raw), CountryTown(country="GB", town=None, postal_code=pc)
 
 
 
@@ -629,6 +651,13 @@ def _extract_geo_from_free_lines(lines, warnings):
             if town:
                 warnings.append(f"short_country_code_normalized:{m_short.group(1).upper()}→{cc}")
                 return CountryTown(country=cc, town=town, postal_code=m_short.group(2)), 1
+
+    # 4b. Pays + postal seul: DE 81929
+    m_country_postal = re.match(r"^([A-Z]{2})\s+(\d{3,10})$", last, flags=re.IGNORECASE)
+    if m_country_postal:
+        cc = m_country_postal.group(1).upper().strip()
+        if cc in COUNTRY_CODES:
+            return CountryTown(country=cc, town=None, postal_code=m_country_postal.group(2).strip()), 1
 
     # 5. Pays connu (nom complet ou code)
     code = resolve_country_code(last)
