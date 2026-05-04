@@ -3,7 +3,7 @@ import re  # ✅ À ajouter en premier
 
 from typing import Dict, Set, List, Optional, Tuple
 from src.models import CanonicalParty
-from src.reference_data import CITIES_BY_COUNTRY, COUNTRY_CODES
+from src.reference_data import CITIES_BY_COUNTRY, COUNTRY_CODES, resolve_country_code
 from src.e2_address_parser import parse_address_line
 from src.toponym_normalizer import (
     canonicalize_toponym, town_known_for_country, find_variant_match_in_address, reduce_to_known_core_toponym, toponyms_equivalent,
@@ -172,6 +172,12 @@ def _validate_pass1_country_town(party: CanonicalParty) -> Tuple[str, str, bool,
     town_source = _norm(geo.town) if geo else ""
     town_raw = canonicalize_toponym(town_source) if geo else ""
 
+    if country and town_raw and resolve_country_code(town_raw) == country:
+        geo.town = None
+        town_source = ""
+        town_raw = ""
+        _append_warning_once(warnings, "town_was_country_alias_rejected")
+
     # 1. 🔍 Détection du contexte "suburb/quartier" dans les lignes d'adresse brutes
     SUBURB_KEYWORDS = {"CITE", "CITÉ", "ZONE", "QUARTIER", "SECTEUR", "IMMEUBLE", "IMM", "LOTISSEMENT"}
     has_suburb_context = any(
@@ -214,7 +220,11 @@ def _validate_pass1_country_town(party: CanonicalParty) -> Tuple[str, str, bool,
             if composite_resolution:
                 resolved_town, matched_via = composite_resolution
                 _append_warning_once(warnings, f"pass1_town_resolved_from_composite:{town_raw}->{resolved_town}:{matched_via}")
-                warnings[:] = [w for w in warnings if "requires_manual_verification" not in str(w)]
+                warnings[:] = [
+                    w for w in warnings
+                    if "requires_manual_verification" not in str(w)
+                    and not str(w).startswith("pass1_town_not_official:")
+                ]
                 return country, resolved_town, True, False
 
             if _looks_like_local_script_town(country, town_raw):
@@ -391,6 +401,34 @@ def validate_party_semantics(party: CanonicalParty) -> CanonicalParty:
     # Mise à jour de l'objet party avec la ville résolue
     if party.country_town:
         party.country_town.town = town
+
+    if town:
+        warnings[:] = [
+            w for w in warnings
+            if str(w) not in {"town_missing", "pass1_town_ambiguous_requires_disambiguation"}
+            and "requires_manual_verification:town_unverified" not in str(w)
+        ]
+
+    # ========== VALIDATION SUPPLÉMENTAIRE: Villes suspicieusement courtes ==========
+    # Pattern suspect: ville très courte (< 4 caractères) sauf pour pays spécifiques
+    # Ex: town="NEW" est suspect, devrait être "NEW YORK"
+    KNOWN_SHORT_TOWNS = {
+        "NY", "LA", "SF", "DC", "DE", "NV", "VA", "TX", "CA", "CO", "MA", "MI", "WI",  # US states
+        "QC", "ON", "BC", "AB",  # Canadian provinces  
+        "UK", "GB", "IE", "FR", "DE", "IT", "ES", "CH", "AT", "BE", "NL", "SE", "NO", "DK", "CZ", "PL",  # European short forms
+    }
+    if town and len(town) == 3 and town not in KNOWN_SHORT_TOWNS:
+        _append_warning_once(warnings, f"pass2_town_suspiciously_short_3chars:{town}")
+        party.meta.parse_confidence = min(party.meta.parse_confidence, 0.65)
+        # Trigger SLM fallback if confidence is low enough
+        if party.meta.parse_confidence < 0.70:
+            _append_warning_once(warnings, "pass2_short_town_requires_slm_verification")
+    
+    # Pattern suspect: ville très courte (< 3 caractères)
+    if town and len(town) < 3:
+        _append_warning_once(warnings, f"pass2_town_critically_short_lt3:{town}")
+        party.meta.parse_confidence = min(party.meta.parse_confidence, 0.55)
+        _append_warning_once(warnings, "requires_manual_verification:critically_short_town")
 
     # Pass 2
     address_results = _validate_pass2_address_lines(party, country, town, geo_coherent)

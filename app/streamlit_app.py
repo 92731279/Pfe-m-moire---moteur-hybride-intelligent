@@ -16,15 +16,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# FORCE_RELOAD_TRIGGER_3
-import sys
-for m in list(sys.modules.keys()):
-    if m.startswith("src."):
-        del sys.modules[m]
-
 from src.pipeline import run_pipeline
 from src.pipeline_logger import PipelineLogger
 from src.iso20022_mapper import build_iso20022_party_xml
+from src.swift_message_parser import extract_party_fields, extract_swift_fields
 import src.pipeline as pipeline_module
 
 def compute_geo_reliability(result):
@@ -753,14 +748,42 @@ def _humanize_signal(signal: str) -> str:
     signal = str(signal)
 
     exact_map = {
-        "pass2_soft:missing_road_like_component": "Adresse partielle: composant voie non explicite, mais extraction acceptable.",
+        "pass2_soft:missing_road_like_component": "Adresse partielle: composant rue non explicite, mais extraction acceptable.",
         "pass2_geo_incoherent_cannot_validate_address": "Incoherence geo: l'adresse ne peut pas etre validee avec la ville/pays extraits.",
         "pass2_address_missing": "Adresse manquante apres parsing.",
+        "town_missing": "Ville absente dans le message initial; le moteur a tente de la completer.",
+        "town_missing_from_name_country_pattern": "Ville absente: la ligne contient surtout un nom et un pays, sans ville explicite.",
         "pass1_town_ambiguous_requires_disambiguation": "Ville ambigue: verification manuelle recommandee.",
+        "pass1_country_missing": "Pays absent dans le message initial.",
+        "pass1_missing_country_town": "Pays et ville absents dans le message initial.",
+        "pass1_town_extracted_from_suburb_and_confirmed": "Ville extraite depuis un quartier/localite et confirmee.",
+        "pass1_town_local_script_accepted": "Ville acceptee dans son ecriture locale.",
+        "pass1_town_is_suburb_keyword_rejected": "Localite detectee comme quartier, pas comme ville principale.",
+        "pass1_suburb_context_detected": "Contexte de quartier/localite detecte.",
+        "pass1_suburb_context_detected_and_town_invalid": "Quartier/localite detecte et ville non validee.",
         "requires_manual_verification:town_unverified": "Ville non verifiee: revue manuelle requise.",
+        "requires_manual_verification:suburb_cannot_be_promoted_to_city": "Revue manuelle requise: un quartier ne peut pas etre utilise comme ville principale.",
+        "no_content_after_account": "Aucune information exploitable apres le compte.",
+        "inline_address_town_split": "Adresse et ville se trouvaient sur la meme ligne; elles ont ete separees.",
+        "name_address_mixed": "Nom et adresse semblent melanges dans la meme zone.",
+        "town_reclassified_as_address": "Un element d'abord lu comme ville a ete reclasse comme adresse.",
+        "ambiguous_city_country_tail": "Fin de ligne ambigue entre ville et pays.",
+        "pass2_no_valid_address_detected": "Aucune adresse valide detectee.",
+        "empty_input": "Message vide.",
+        "invalid_structured_line_3": "Ligne structuree 3 invalide.",
+        "missing_mandatory_3": "Ligne obligatoire 3 manquante.",
+        "4_and_5_must_appear_together": "Les lignes 4 et 5 doivent apparaitre ensemble.",
         "line_8_non_identifier_narrative": "Ligne 8 detectee comme texte narratif, pas comme identifiant.",
+        "line_8_length_exceeds_35": "Ligne 8 trop longue pour le format attendu.",
+        "orphan_continuation_line": "Ligne de continuation sans ligne parent.",
+        "T56_invalid_8_continuation": "Continuation de ligne 8 invalide pour le format T56.",
         "T56_invalid_8_semantic_content": "Ligne 8 semantiquement invalide pour le format T56.",
+        "T56_invalid_8_repetition": "Repetition invalide de la ligne 8 pour le format T56.",
         "slm_applied": "Fallback SLM applique pour renforcer l'extraction.",
+        "slm_cached": "Resultat SLM recupere depuis le cache.",
+        "slm_failed": "Fallback SLM tente, mais aucune reponse exploitable n'a ete obtenue.",
+        "fast_track_slm_triggered_due_to_complexity": "IA declenchee rapidement car le message etait complexe.",
+        "town_was_country_alias_rejected": "Une valeur de pays avait ete lue comme ville; elle a ete corrigee.",
         "quarantine_manual_review_required": "Message place en quarantaine pour revue manuelle.",
         "mandatory_missing:town": "Rejet: ville obligatoire manquante.",
         "mandatory_missing:country": "Rejet: pays obligatoire manquant.",
@@ -771,6 +794,18 @@ def _humanize_signal(signal: str) -> str:
     if signal.startswith("pass1_town_confirmed_geonames:"):
         method = signal.split(":", 1)[1]
         return f"Ville confirmee par GeoNames ({method})."
+    if signal.startswith("slm_town_rejected_backend_validation:"):
+        reason = signal.split(":", 1)[1].replace("_", " ")
+        return f"La ville proposee par l'IA a ete rejetee par la validation backend ({reason})."
+    if signal.startswith("short_country_code_normalized:"):
+        details = signal.split(":", 1)[1]
+        return f"Code pays court normalise ({details})."
+    if signal.startswith("country_embedded_in_town_line:"):
+        country = signal.split(":", 1)[1]
+        return f"Pays detecte dans la ligne de ville ({country})."
+    if signal.startswith("pass1_locality_has_parent:"):
+        details = signal.split(":", 1)[1]
+        return f"Localite rattachee a une ville principale ({details})."
     if signal.startswith("pass2_town_backfilled_from_fragmentation:"):
         town = signal.split(":", 1)[1]
         return f"Ville completee automatiquement depuis la fragmentation ({town})."
@@ -786,11 +821,54 @@ def _humanize_signal(signal: str) -> str:
     if signal.startswith("pass2_address_contains_town_or_country:"):
         line = signal.split(":", 1)[1]
         return f"Adresse contient deja une information geo (ville/pays): {line}."
+    if signal.startswith("pass2_address_contextually_accepted:"):
+        line = signal.split(":", 1)[1]
+        return f"Adresse acceptee par controle contextuel: {line}."
+    if signal.startswith("pass2_invalid_address_line:"):
+        line = signal.split(":", 1)[1]
+        return f"Ligne d'adresse invalide ou insuffisante: {line}."
+    if signal.startswith("pass2_libpostal:"):
+        details = signal.split(":", 1)[1]
+        return f"Analyse d'adresse incomplete ({details.replace('_', ' ')})."
+    if signal.startswith("pass2_soft:"):
+        details = signal.split(":", 1)[1]
+        return f"Remarque souple sur l'adresse ({details.replace('_', ' ')})."
+    if signal.startswith("multiline_name_fused:"):
+        count = signal.split(":", 1)[1]
+        return f"Nom reconstitue depuis plusieurs lignes ({count} ligne ajoutee)."
+    if signal.startswith("zone_industrielle_extracted_town:"):
+        town = signal.split(":", 1)[1]
+        return f"Ville extraite depuis une ligne de zone industrielle ({town})."
+    if signal.startswith("ambiguous_city_country_tail_resolved_as_town:"):
+        reason = signal.split(":", 1)[1]
+        return f"Fin de ligne ambigue resolue comme ville ({reason})."
+    if signal.startswith("ambiguous_city_country_tail_resolved_as_address:"):
+        reason = signal.split(":", 1)[1]
+        return f"Fin de ligne ambigue conservee comme adresse ({reason})."
+    if signal.startswith("unclassified_line_to_address:"):
+        line = signal.split(":", 1)[1]
+        return f"Ligne non classee rattachee a l'adresse: {line}."
     if signal.startswith("country_from_iban"):
         return "Pays deduit depuis l'IBAN."
     if signal.startswith("country_conflict_iban_hint_only:"):
         conflict = signal.split(":", 1)[1]
+        if "!=" in conflict:
+            left, right = conflict.split("!=", 1)
+            left = left.replace("explicit:", "").strip()
+            right = right.replace("explicit:", "").strip()
+            return f"Le pays indique par l'IBAN ({left}) est different du pays ecrit dans le message ({right}); le contenu explicite est conserve."
         return f"Conflit pays entre IBAN et contenu explicite ({conflict})."
+    if signal.startswith("geo_postal_inference_"):
+        m = re.match(r"^geo_postal_inference(?:_slm)?_([A-Z]{2}):(.+?)→(.+)$", signal)
+        if m:
+            country, postal, town = m.groups()
+            source = " par IA" if signal.startswith("geo_postal_inference_slm_") else ""
+            return f"Ville deduite{source} depuis le code postal {postal} ({country}): {town}."
+        details = signal.split(":", 1)[1] if ":" in signal else signal
+        if "→" in details:
+            postal, town = details.split("→", 1)
+            return f"Ville deduite automatiquement depuis le code postal {postal}: {town}."
+        return f"Ville deduite automatiquement depuis le code postal ({details})."
 
     return signal.replace("_", " ").strip().capitalize()
 
@@ -919,7 +997,7 @@ def render_result_card(result, elapsed: float):
                 <div class="result-value">{html.escape(str(country))}</div>
             </div>
             <div class="result-item">
-                <div class="result-label">🔧 Voie</div>
+                <div class="result-label">🔧 Rue</div>
                 <div class="result-value">{html.escape(str(route))}</div>
             </div>
         </div>
@@ -1056,6 +1134,189 @@ def _safe_dump_model(obj):
         return vars(obj)
 
 
+def _dedupe_preserve_order(items):
+    seen = set()
+    result = []
+    for item in items or []:
+        key = str(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _prune_empty_values(value):
+    if isinstance(value, dict):
+        cleaned = {
+            k: _prune_empty_values(v)
+            for k, v in value.items()
+        }
+        return {k: v for k, v in cleaned.items() if v not in (None, [], {}, "")}
+    if isinstance(value, list):
+        return [_prune_empty_values(v) for v in value if v not in (None, [], {}, "")]
+    return value
+
+
+def _party_type_label(is_org):
+    if is_org is True:
+        return "Organisation / entreprise"
+    if is_org is False:
+        return "Personne physique"
+    return "Non determine"
+
+
+def _party_field_context(field_type, role):
+    field = str(field_type or "").upper()
+    if field.startswith("50"):
+        return {
+            "party_key": "donneur_ordre",
+            "party_label": "Donneur d'ordre",
+            "account_key": "compte_donneur_ordre",
+            "name_key": "nom_donneur_ordre",
+            "type_key": "type_donneur_ordre",
+            "address_key": "adresse_donneur_ordre",
+        }
+    if field.startswith("59"):
+        return {
+            "party_key": "beneficiaire",
+            "party_label": "Beneficiaire",
+            "account_key": "compte_beneficiaire",
+            "name_key": "nom_beneficiaire",
+            "type_key": "type_beneficiaire",
+            "address_key": "adresse_beneficiaire",
+        }
+
+    role_key = "donneur_ordre" if role == "debtor" else "beneficiaire" if role == "creditor" else "partie"
+    return {
+        "party_key": role_key,
+        "party_label": role_key.replace("_", " ").capitalize(),
+        "account_key": f"compte_{role_key}",
+        "name_key": f"nom_{role_key}",
+        "type_key": f"type_{role_key}",
+        "address_key": f"adresse_{role_key}",
+    }
+
+
+def _humanize_contextual_check(key, value):
+    yes_no = "Oui" if value is True else "Non" if value is False else "Non disponible" if value is None else value
+    labels = {
+        "intrinsic_valid": "La ligne ressemble a une adresse valide",
+        "locally_plausible": "L'adresse est plausible pour la ville/pays detectes",
+        "geo_consistent_with_pass1": "L'adresse est coherente avec la ville/pays extraits au premier passage",
+        "contains_town_or_country": "La ligne contient deja une ville ou un pays",
+        "geo_coherent_pass1": "La verification geographique globale est coherente",
+        "town": "Ville utilisee pour la verification",
+        "country": "Pays utilise pour la verification",
+    }
+    label = labels.get(str(key), str(key).replace("_", " ").capitalize())
+    return {"controle": label, "resultat": yes_no}
+
+
+def _humanize_address_validation(item):
+    checks = item.get("contextual_checks") or {}
+    components = item.get("components") or {}
+    parsed = item.get("parsed") or []
+    readable_components = {
+        "rue": components.get("ROAD"),
+        "numero": components.get("HOUSE_NUMBER"),
+        "code_postal": components.get("POSTCODE"),
+        "ville": components.get("CITY") or components.get("TOWN"),
+        "pays": components.get("COUNTRY"),
+    }
+
+    return {
+        "adresse_analysee": item.get("raw"),
+        "decision": "Adresse acceptee" if item.get("contextual_valid") else "Adresse a verifier",
+        "lecture_adresse": {k: v for k, v in readable_components.items() if v not in (None, "", [])},
+        "controles": [_humanize_contextual_check(k, v) for k, v in checks.items()],
+        "details_parser": [
+            {"valeur": pair[0], "type": str(pair[1]).replace("_", " ")}
+            for pair in parsed
+            if isinstance(pair, (list, tuple)) and len(pair) == 2
+        ],
+        "remarques": [_humanize_signal(w) for w in _dedupe_preserve_order(item.get("warnings") or [])],
+    }
+
+
+def _display_fragment_json(fragment):
+    data = _safe_dump_model(fragment)
+    labels = {
+        "strt_nm": "rue",
+        "bldg_nb": "numero_batiment",
+        "bldg_nm": "nom_batiment",
+        "flr": "etage",
+        "room": "piece",
+        "pst_cd": "code_postal",
+        "twn_nm": "ville",
+        "ctry_sub_div": "region",
+        "ctry": "pays",
+        "adr_line": "lignes_adresse_libres",
+        "fragmentation_confidence": "confiance_fragmentation",
+        "fallback_used": "fragmentation_de_secours_utilisee",
+    }
+    return {
+        labels.get(k, k): v
+        for k, v in data.items()
+        if v not in (None, [], "") and not (isinstance(v, bool) and v is False)
+    }
+
+
+def _build_display_json(result):
+    geo = result.country_town
+    meta = result.meta
+    party_context = _party_field_context(result.field_type, result.role)
+    before_slm_raw = _dedupe_preserve_order(getattr(meta, "warnings_before_slm", []) or [])
+    after_slm_raw = _dedupe_preserve_order(getattr(meta, "warnings_after_slm", []) or [])
+    warnings_before_slm = [_humanize_signal(w) for w in before_slm_raw]
+    warnings_after_slm = [_humanize_signal(w) for w in after_slm_raw]
+    llm_signals = [_humanize_signal(s) for s in _dedupe_preserve_order(getattr(meta, "llm_signals", []) or [])]
+    rejection_reasons = [
+        _humanize_signal(r)
+        for r in _dedupe_preserve_order(getattr(meta, "rejection_reasons", []) or [])
+    ]
+
+    display = {
+        "type_champ_swift": result.field_type,
+        "role_metier": party_context["party_label"],
+        party_context["account_key"]: result.account,
+        "identifiant_partie": _safe_dump_model(result.party_id) if result.party_id else None,
+        party_context["name_key"]: result.name,
+        party_context["type_key"]: _party_type_label(result.is_org),
+        party_context["address_key"]: result.address_lines,
+        "localisation": {
+            "pays": geo.country if geo else None,
+            "ville": geo.town if geo else None,
+            "code_postal": geo.postal_code if geo else None,
+        },
+        "date_naissance": _safe_dump_model(result.dob) if result.dob else None,
+        "lieu_naissance": _safe_dump_model(result.pob) if result.pob else None,
+        "identifiant_organisation": _safe_dump_model(result.org_id) if result.org_id else None,
+        "identifiant_national": result.national_id,
+        "complement_postal": result.postal_complement,
+        "qualite": {
+            "confiance": getattr(meta, "parse_confidence", 0.0),
+            "slm_utilise": "Oui" if getattr(meta, "fallback_used", False) else "Non",
+            "decision": "Rejete" if getattr(meta, "rejected", False) else "Accepte",
+            "revue_manuelle": "Oui" if getattr(meta, "requires_manual_review", False) else "Non",
+            "remarques_avant_ia": warnings_before_slm,
+            "remarques_apres_ia": warnings_after_slm,
+            "signaux_ia": llm_signals,
+            "raisons_rejet": rejection_reasons,
+        },
+        "validation_adresse": [
+            _humanize_address_validation(item)
+            for item in (getattr(result, "address_validation", []) or [])
+        ],
+        "fragments_adresse": [
+            _display_fragment_json(fragment)
+            for fragment in (getattr(result, "fragmented_addresses", []) or [])
+        ],
+    }
+
+    return _prune_empty_values(display)
+
+
 def _run_case(raw_message: str, message_id: str = "UI_CASE", slm_model: str = "qwen2.5:0.5b"):
     class SilentLogger(PipelineLogger):
         def log(self, *args, **kwargs):
@@ -1151,6 +1412,8 @@ with st.sidebar:
         [
             "🚀 Mode Avancé",
             "✅ Mode Validation",
+            "🧾 Message SWIFT complet",
+            "🔄 Mode Traitement Complet",
         ],
         label_visibility="collapsed"
     )
@@ -1186,9 +1449,29 @@ if page == "🚀 Mode Avancé":
         st.markdown('<div class="section-title">📥 Entrée SWIFT</div>', unsafe_allow_html=True)
         with st.container():
             st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-            dataset_choice = st.selectbox("Cas de test", options=list(options.keys()), label_visibility="collapsed")
-            default_val = options[dataset_choice] if dataset_choice else ":59:/TN123456\nNOM PRENOM\nADRESSE\nVILLE PAYS"
-            raw_message = st.text_area("Message SWIFT", value=default_val, height=160, label_visibility="collapsed")
+            
+            # Onglets de source d'entrée
+            input_source = st.radio("Source d'entrée", options=["📝 Coller du texte", "🔽 Sélectionner un cas", "📂 Importer un fichier"], horizontal=True, label_visibility="collapsed")
+            
+            raw_message = ""
+            
+            if input_source == "🔽 Sélectionner un cas":
+                dataset_choice = st.selectbox("Cas de test", options=list(options.keys()), label_visibility="collapsed")
+                raw_message = options[dataset_choice] if dataset_choice else ""
+                st.info(f"✓ Cas sélectionné: {dataset_choice}")
+            
+            elif input_source == "📂 Importer un fichier":
+                uploaded_file = st.file_uploader("Choisir un fichier SWIFT", type=["txt", "swift", "msg", ""], label_visibility="collapsed")
+                if uploaded_file is not None:
+                    raw_message = uploaded_file.read().decode("utf-8", errors="ignore")
+                    st.success(f"✓ Fichier chargé: {uploaded_file.name} ({len(raw_message)} caractères)")
+                    st.text_area("📄 Contenu du fichier", value=raw_message, height=140, disabled=True, label_visibility="collapsed")
+                else:
+                    st.warning("Veuillez sélectionner un fichier")
+            
+            else:  # Coller du texte
+                raw_message = st.text_area("Message SWIFT", value="", height=160, label_visibility="collapsed")
+            
             st.text_input("Modèle SLM (Fallback)", value="qwen2.5:0.5b", disabled=True)
             run = st.button("🚀 LANCER L'ANALYSE")
             st.markdown('</div>', unsafe_allow_html=True)
@@ -1232,22 +1515,102 @@ if page == "🚀 Mode Avancé":
 
             # Onglets techniques
             st.markdown('<div class="section-title">🗂️ Détails Techniques</div>', unsafe_allow_html=True)
-            t1, t2, t3, t4, t5 = st.tabs(["📋 JSON Complet", "✅ Décision Finale", "✂️ Fragments", "🧩 JSON ISO 20022", "🧾 XML ISO 20022"])
+            t1, t2, t3, t4, t5, t6 = st.tabs(["📋 JSON Lisible", "✅ Décision Finale", "🔍 Validation Post-SLM", "✂️ Fragments", "🧩 JSON ISO 20022", "🧾 XML ISO 20022"])
 
             with t1:
                 with st.container():
                     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-                    try:
-                        st.json(result.model_dump())
-                    except:
-                        import dataclasses
-                        st.json(dataclasses.asdict(result) if dataclasses.is_dataclass(result) else vars(result))
+                    st.json(_build_display_json(result))
                     st.markdown('</div>', unsafe_allow_html=True)
 
             with t2:
                 _render_final_signal_panel(result)
 
             with t3:
+                # 🔍 ONGLET VALIDATION POST-SLM — Afficher validation stricte
+                with st.container():
+                    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+                    
+                    fallback_used = getattr(result.meta, 'fallback_used', False)
+                    llm_signals = list(getattr(result.meta, 'llm_signals', []) or [])
+                    warnings_all = list(getattr(result.meta, 'warnings', []) or [])
+                    rejected = getattr(result.meta, 'rejected', False)
+                    rejection_reasons = list(getattr(result.meta, 'rejection_reasons', []) or [])
+                    requires_manual_review = getattr(result.meta, 'requires_manual_review', False)
+                    
+                    # Affichage du statut de fallback
+                    col_fb1, col_fb2, col_fb3 = st.columns(3)
+                    with col_fb1:
+                        if fallback_used:
+                            st.metric("📡 Fallback SLM", "✅ Utilisé")
+                        else:
+                            st.metric("📡 Fallback SLM", "❌ Non utilisé")
+                    
+                    with col_fb2:
+                        if rejected:
+                            st.metric("🚫 Statut", "REJETÉ")
+                        elif requires_manual_review:
+                            st.metric("⚠️ Statut", "RÉVISION")
+                        else:
+                            st.metric("✅ Statut", "ACCEPTÉ")
+                    
+                    with col_fb3:
+                        confidence = float(getattr(result.meta, 'parse_confidence', 0.0) or 0.0)
+                        st.metric("📊 Confiance", f"{int(confidence*100)}%")
+                    
+                    st.divider()
+                    
+                    # LLM Signals
+                    if llm_signals:
+                        st.subheader("🧠 Signaux LLM")
+                        for signal in llm_signals:
+                            st.success(f"✓ {signal}")
+                    
+                    # Validation Warnings (filtrés pour SLM/postal/inference)
+                    slm_related_warnings = [w for w in warnings_all if any(kw in str(w).lower() for kw in ['slm', 'postal', 'inference', 'validation', 'geo_', 'pass'])]
+                    
+                    if slm_related_warnings:
+                        st.subheader("🔎 Validations Post-SLM/Inférence")
+                        for warning in slm_related_warnings:
+                            warning_str = str(warning)
+                            if "error" in warning_str.lower() or "fail" in warning_str.lower() or "reject" in warning_str.lower():
+                                st.error(f"🚫 {warning_str}")
+                            elif "warn" in warning_str.lower() or "suspicious" in warning_str.lower() or "alert" in warning_str.lower():
+                                st.warning(f"⚠️ {warning_str}")
+                            elif "pass" in warning_str.lower() or "confirm" in warning_str.lower() or "valid" in warning_str.lower():
+                                st.success(f"✓ {warning_str}")
+                            else:
+                                st.info(f"ℹ️ {warning_str}")
+                    
+                    # Rejection Reasons (si rejeté)
+                    if rejected and rejection_reasons:
+                        st.subheader("🚨 Raisons du Rejet")
+                        for reason in rejection_reasons:
+                            st.error(f"❌ {reason}")
+                    
+                    # Applied Results (Ville, Pays, Postal)
+                    if result.country_town:
+                        st.subheader("✅ Résultats Appliqués")
+                        col_res1, col_res2, col_res3 = st.columns(3)
+                        with col_res1:
+                            if result.country_town.town:
+                                st.success(f"🏘️ Ville: {result.country_town.town}")
+                            else:
+                                st.error("🏘️ Ville: N/A")
+                        with col_res2:
+                            if result.country_town.country:
+                                st.success(f"🌍 Pays: {result.country_town.country}")
+                            else:
+                                st.error("🌍 Pays: N/A")
+                        with col_res3:
+                            if result.country_town.postal_code:
+                                st.success(f"📮 Postal: {result.country_town.postal_code}")
+                            else:
+                                st.info("📮 Postal: N/A")
+                    
+                    st.markdown('</div>', unsafe_allow_html=True)
+
+            with t4:
                 frag_list = getattr(result, 'fragmented_addresses', [])
                 if not frag_list:
                     st.info("Aucune fragmentation générée")
@@ -1256,21 +1619,17 @@ if page == "🚀 Mode Avancé":
                         with st.container():
                             st.markdown('<div class="glass-card">', unsafe_allow_html=True)
                             st.write(f"**Passe {idx+1}** (Confiance: {getattr(f, 'fragmentation_confidence', 'N/A')})")
-                            try:
-                                st.json(f.model_dump())
-                            except:
-                                import dataclasses
-                                st.json(dataclasses.asdict(f) if dataclasses.is_dataclass(f) else vars(f))
+                            st.json(_display_fragment_json(f))
                             st.markdown('</div>', unsafe_allow_html=True)
 
             iso_xml, iso_payload, iso_errors = build_iso20022_party_xml(result, include_envelope=True)
-            with t4:
+            with t5:
                 with st.container():
                     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
                     st.json(iso_payload)
                     st.markdown('</div>', unsafe_allow_html=True)
 
-            with t5:
+            with t6:
                 with st.container():
                     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
                     if iso_errors:
@@ -1279,6 +1638,137 @@ if page == "🚀 Mode Avancé":
                         st.success("XML ISO 20022 bien formé")
                     st.code(iso_xml, language="xml")
                     st.markdown('</div>', unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 2 — MESSAGE SWIFT COMPLET
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "🧾 Message SWIFT complet":
+    render_hero(
+        "Traitement Message SWIFT Complet",
+        "Extraction automatique des champs 50F/50K et 59F/59, puis traitement séparé par le moteur classique",
+        "FULL MESSAGE"
+    )
+
+    sample_full_message = """{1:F01BIATTNTTXXXX4333652311}{2:I202COBADEFFXXXXN}{3:{108:242007V9CH49978}{119:COV}{121:cefe6327-38af-41f0-ba0d-d6ced37c22v8}}{4:
+:20:FT24200431063957
+:21:TE2420000101
+:32A:240724EUR722,00
+:53B:/D/400886502400EUR
+:58A:BZITTNTTXXX
+:50F:/TN5908003000515000002789
+1/SABRINA CONFECTION
+2/ZONE INDUSTRIELLE KSAR SAID
+3/TN/MANOUBA
+:57A:BZITTNTTXXX
+:59F:/TN5925048000000102575734
+1/FLEN BEN FLEN
+2/TUNIS
+3/TN/TN 8090
+:70:TEST
+:72:/ACC/BICIGNCXXXX AVENUE DE LA R
+-}"""
+
+    st.markdown('<div class="section-title">📥 Message FIN complet</div>', unsafe_allow_html=True)
+    with st.container():
+        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+        input_mode = st.radio(
+            "Source",
+            ["📝 Coller un message", "📋 Charger l'exemple", "📂 Importer un fichier"],
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+
+        if input_mode == "📋 Charger l'exemple":
+            full_message = st.text_area("Message SWIFT complet", value=sample_full_message, height=330, label_visibility="collapsed")
+        elif input_mode == "📂 Importer un fichier":
+            uploaded_file = st.file_uploader("Choisir un fichier FIN", type=["txt", "swift", "msg", ""], label_visibility="collapsed")
+            if uploaded_file is not None:
+                full_message = uploaded_file.read().decode("utf-8", errors="ignore")
+                st.success(f"Fichier chargé: {uploaded_file.name}")
+            else:
+                full_message = ""
+            full_message = st.text_area("Message SWIFT complet", value=full_message, height=330, label_visibility="collapsed")
+        else:
+            full_message = st.text_area("Message SWIFT complet", value="", height=330, label_visibility="collapsed")
+
+        run_full_message = st.button("🔎 EXTRAIRE ET TRAITER LES PARTIES")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    if run_full_message:
+        all_fields = extract_swift_fields(full_message)
+        party_fields = extract_party_fields(full_message)
+        other_fields = [f for f in all_fields if str(f.get("tag", "")).upper() not in {"50F", "50K", "59F", "59"}]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Champs SWIFT détectés", len(all_fields))
+        m2.metric("Parties à traiter", len(party_fields))
+        m3.metric("Champs complémentaires", len(other_fields))
+
+        if not party_fields:
+            st.error("Aucun champ 50F, 50K, 59F ou 59 détecté dans le message.")
+        else:
+            st.markdown('<div class="section-title">👥 Résultats Debtor / Creditor</div>', unsafe_allow_html=True)
+            tabs = st.tabs([f"{p['role_label']} · {p['tag']}" for p in party_fields])
+            summary_rows = []
+
+            for idx, (tab, party_field) in enumerate(zip(tabs, party_fields), start=1):
+                with tab:
+                    raw_party = party_field["raw_party_field"]
+                    result, logger, elapsed, iso_xml, iso_payload, iso_errors = _run_case(
+                        raw_party,
+                        message_id=f"FULL_SWIFT_{party_field['tag']}_{idx:02d}",
+                    )
+                    geo = result.country_town
+                    summary_rows.append({
+                        "role": party_field["role_label"],
+                        "tag": party_field["tag"],
+                        "account": result.account,
+                        "name": " | ".join(result.name or []),
+                        "town": geo.town if geo else None,
+                        "country": geo.country if geo else None,
+                        "confidence": round(float(getattr(result.meta, "parse_confidence", 0.0) or 0.0), 3),
+                        "decision": "Rejete" if getattr(result.meta, "rejected", False) else "Accepte",
+                    })
+
+                    col_raw, col_res = st.columns([0.8, 1.2], gap="large")
+                    with col_raw:
+                        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+                        st.write(f"**Champ source :** `{party_field['tag']}`")
+                        st.write(f"**Rôle :** {party_field['role_label']}")
+                        st.code(raw_party, language="text")
+                        st.markdown('</div>', unsafe_allow_html=True)
+
+                    with col_res:
+                        st.markdown(render_result_card(result, elapsed), unsafe_allow_html=True)
+
+                    details_a, details_b, details_c = st.tabs(["JSON métier", "JSON ISO 20022", "XML ISO 20022"])
+                    with details_a:
+                        st.json(_build_display_json(result))
+                    with details_b:
+                        st.json(iso_payload)
+                    with details_c:
+                        if iso_errors:
+                            st.warning("Validation ISO incomplète: " + " | ".join(iso_errors))
+                        st.code(iso_xml, language="xml")
+
+            st.markdown('<div class="section-title">📌 Synthèse</div>', unsafe_allow_html=True)
+            st.dataframe(summary_rows, use_container_width=True)
+
+        st.markdown('<div class="section-title">➕ Champs complémentaires conservés</div>', unsafe_allow_html=True)
+        if other_fields:
+            st.dataframe(
+                [
+                    {
+                        "tag": field.get("tag"),
+                        "ligne": field.get("line_no"),
+                        "valeur": "\n".join(field.get("lines") or []),
+                    }
+                    for field in other_fields
+                ],
+                use_container_width=True,
+            )
+        else:
+            st.info("Aucun autre champ détecté.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PAGE 2 — MODE VALIDATION
@@ -1296,9 +1786,29 @@ elif page == "✅ Mode Validation":
         st.markdown('<div class="section-title">📥 Saisie</div>', unsafe_allow_html=True)
         with st.container():
             st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-            dataset_choice = st.selectbox("Cas de test", options=list(options.keys()))
-            default_val = options[dataset_choice] if dataset_choice else ":59:/TN123456\nNOM PRENOM\nADRESSE\nVILLE PAYS"
-            raw_message = st.text_area("Message SWIFT", value=default_val, height=180)
+            
+            # Onglets de source d'entrée
+            input_source = st.radio("Source d'entrée", options=["📝 Coller du texte", "🔽 Sélectionner un cas", "📂 Importer un fichier"], horizontal=True, label_visibility="collapsed")
+            
+            raw_message = ""
+            
+            if input_source == "🔽 Sélectionner un cas":
+                dataset_choice = st.selectbox("Cas de test", options=list(options.keys()), label_visibility="collapsed")
+                raw_message = options[dataset_choice] if dataset_choice else ""
+                st.info(f"✓ Cas sélectionné: {dataset_choice}")
+            
+            elif input_source == "📂 Importer un fichier":
+                uploaded_file = st.file_uploader("Choisir un fichier SWIFT", type=["txt", "swift", "msg", ""], label_visibility="collapsed")
+                if uploaded_file is not None:
+                    raw_message = uploaded_file.read().decode("utf-8", errors="ignore")
+                    st.success(f"✓ Fichier chargé: {uploaded_file.name} ({len(raw_message)} caractères)")
+                    st.text_area("📄 Contenu du fichier", value=raw_message, height=140, disabled=True, label_visibility="collapsed")
+                else:
+                    st.warning("Veuillez sélectionner un fichier")
+            
+            else:  # Coller du texte
+                raw_message = st.text_area("Message SWIFT", value="", height=180, label_visibility="collapsed")
+            
             run_simple = st.button("▶️ EXTRAIRE LE JSON")
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1529,7 +2039,7 @@ elif page == "🧠 Avant/Après SLM":
     )
 
     case_label = st.selectbox("Cas", options=list(options.keys()))
-    raw_message = st.text_area("Message SWIFT", value=options[case_label], height=190)
+    raw_message = st.text_area("Message SWIFT", value="", height=190)
 
     if st.button("🔬 Comparer avant/après"):
         before, logger_before, elapsed_before = _run_case_without_slm(raw_message, message_id="BEFORE_SLM")
@@ -1578,7 +2088,7 @@ elif page == "🔎 Explainability":
     )
 
     case_label = st.selectbox("Cas d'analyse", options=list(options.keys()))
-    raw_message = st.text_area("Message", value=options[case_label], height=180)
+    raw_message = st.text_area("Message", value="", height=180)
 
     if st.button("🧾 Expliquer la décision"):
         result, logger, elapsed, _, _, _ = _run_case(raw_message, message_id="EXPLAIN")
@@ -1665,11 +2175,11 @@ elif page == "📦 Export Pro":
     )
 
     case_label = st.selectbox("Cas à exporter", options=list(options.keys()))
-    raw_message = st.text_area("Message", value=options[case_label], height=180)
+    raw_message = st.text_area("Message", value="", height=180)
 
     if st.button("📤 Générer les exports"):
         result, logger, elapsed, iso_xml, iso_payload, iso_errors = _run_case(raw_message, message_id="EXPORT")
-        result_dump = _safe_dump_model(result)
+        result_dump = _build_display_json(result)
         trace_dump = logger.as_dicts()
 
         st.download_button(

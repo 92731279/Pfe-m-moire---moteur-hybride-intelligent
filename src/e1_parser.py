@@ -47,6 +47,7 @@ from src.toponym_normalizer import canonicalize_toponym
 def _is_known_country_name(line): return resolve_country_code(line) is not None
 def _is_known_city(line): return canonicalize_toponym(_norm(line).upper()) in KNOWN_CITIES
 def _known_city_country(line): return KNOWN_CITIES.get(canonicalize_toponym(_norm(line).upper()))
+def _is_country_token(value): return resolve_country_code(value) is not None
 def _contains_address_keyword(value):
     up = _norm(value).upper()
     if not up: return False
@@ -132,10 +133,46 @@ def _clean_town_value(town):
     return cleaned or None
 
 def _detect_org(name_lines):
+    """
+    Détecte si c'est une organisation ou une personne.
+    
+    Heuristique améliorée:
+    - "JOHN DOE COMPANY" → Organisation (4+ mots avec org hint)
+    - "JOHN DOE CO" (où CO = Colorado) → Personne (faux positif: 2-lettre hint qui est un code région)
+    - "ACME CORP" → Organisation (org hint présent)
+    - "JOHN DOE" → Personne (2 mots normaux, pas d'org hint)
+    """
     txt = " ".join(name_lines).upper()
-    if any(k in txt for k in ORG_HINTS): return True
     words = txt.split()
-    if len(words) == 2 and all(re.fullmatch(r"[A-Z.-]+", w) for w in words): return False
+    
+    # Heuristique 1: Chercher d'abord les indices d'organisation
+    # MAIS: Si le dernier mot est une 2-lettre ORG_HINT ET c'est un code de région/pays,
+    # on l'ignore (ex: "JOHN DOE CO" où CO = Colorado, pas Company)
+    
+    US_STATE_CODES = {
+        "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+        "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+        "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+        "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+        "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"
+    }
+    
+    # Chercher les ORG_HINTS mais exclure les cas faux positifs
+    for hint in ORG_HINTS:
+        pattern = rf"(?<![A-Z0-9]){re.escape(hint)}(?![A-Z0-9])"
+        if re.search(pattern, txt):
+            # ⚠️ EXCEPTION: Si c'est un 2-lettre hint EN FIN DE LIGNE ET c'est un US state code
+            if len(hint) == 2 and words and words[-1] == hint and hint in US_STATE_CODES:
+                # Ignore this false positive (ex: "JOHN DOE CO" where CO = Colorado)
+                continue
+            
+            # Sinon, c'est un vrai indice d'organisation
+            return True
+    
+    # Heuristique 2: Si c'est 2-4 mots normaux SANS org hint détecté, c'est une personne
+    if 2 <= len(words) <= 4 and all(re.fullmatch(r"[A-ZÀ-ÖØ-ÝĀ-ž'.-]+", w) for w in words):
+        return False
+    
     return None
 
 def _deduplicate_addresses(address_lines):
@@ -488,6 +525,15 @@ def _extract_country_postal_town_fragment(line):
                 town = _clean_town_value(_norm(m.group(3)))
                 if town: return m.start(), m.end(), CountryTown(country=cc, town=town, postal_code=m.group(2))
 
+    # 1b. Standard inverse: POSTAL CC (ex: 60311 DE, 1000 TN).
+    # Le deuxième token est un pays, jamais une ville.
+    m = re.search(r"^([A-Z0-9][A-Z0-9\- ]{2,10})\s+([A-Z]{2})$", raw, flags=re.IGNORECASE)
+    if m:
+        cc = m.group(2).upper().strip()
+        postal = _norm(m.group(1)).strip()
+        if cc in COUNTRY_CODES and re.search(r"\d", postal):
+            return m.start(), m.end(), CountryTown(country=cc, town=None, postal_code=postal)
+
     # 2. Format court: B -6600 BASTOGNE
     m = re.search(r"^([A-Za-z]{1,2})\s*[-–]\s*(\d{3,10})\s+([A-Z][A-Z0-9()' .\-]+)$", raw, flags=re.IGNORECASE)
     if m:
@@ -516,6 +562,17 @@ def _extract_country_postal_town_fragment(line):
         if town and state and postal:
             return m.start(), m.end(), CountryTown(country="US", town=town, postal_code=postal)
 
+    # 3c. ✅ CRITICAL FIX: Format simple "VILLE PAYS_CODE" (ex: "NEW YORK US", "LONDON GB")
+    # Ce pattern DOIT être AVANT le pattern "VILLE PROVINCE POSTAL PAYS" pour éviter
+    # que "NEW YORK US" soit parsé comme town="NEW", postal="YORK"
+    m = re.search(r"^([A-Z][A-Z0-9()' .\-]+)\s+([A-Z]{2})$", raw, flags=re.IGNORECASE)
+    if m:
+        potential_town = _clean_town_value(_norm(m.group(1)))
+        potential_cc = m.group(2).upper()
+        if potential_cc in COUNTRY_CODES and potential_town and len(potential_town) >= 3:
+            # This is "TOWN COUNTRY" format, return it directly
+            return m.start(), m.end(), CountryTown(country=potential_cc, town=potential_town, postal_code=None)
+
     # 4. Format VILLE PROVINCE POSTAL PAYS (ex: QUEBEC QC G1G6L5 CA ou QUEBEC QC G1G 6L5 CA)
     # Match: (Ville et mots) (2 lettres province/état optionnel) (Code postal CA ou standard) (CA/US)
     m = re.search(r"^([A-Z][A-Z0-9()' .\-]+?)\s+(?:[A-Z]{2}\s+)?([A-Z0-9][A-Z0-9\- ]{2,8})\s+(CA|US)$", raw, flags=re.IGNORECASE)
@@ -534,11 +591,23 @@ def _extract_country_postal_town_fragment(line):
         if town and not _contains_address_keyword(town):
             return m.start(), m.end(), CountryTown(country="GB", town=town, postal_code=pc)
 
+    # 4c. Format postal alphanumérique européen: 1012 LP AMSTERDAM NL (NL),
+    # D02 X285 DUBLIN IE, etc. On garde le code pays final séparé de la ville.
+    m = re.search(r"^([0-9]{3,5}\s+[A-Z]{1,3})\s+([A-Z][A-Z0-9()' .\-]+?)\s+([A-Z]{2})$", raw, flags=re.IGNORECASE)
+    if m:
+        cc = m.group(3).upper().strip()
+        town = _clean_town_value(_norm(m.group(2)))
+        if cc in COUNTRY_CODES and town and not _is_country_token(town) and not _contains_address_keyword(town):
+            return m.start(), m.end(), CountryTown(country=cc, town=town, postal_code=_norm(m.group(1)))
+
     # 5. Postal seul: 38100 GRENOBLE
     m = re.match(r"^(\d{4,6})\s+([A-Z][A-Z0-9()' .\-]+)$", raw, flags=re.IGNORECASE)
     if m:
         town = _clean_town_value(_norm(m.group(2)))
         # Eviter que ça matche de faux numéros de rue (ex: 8846 RUE VALADE)
+        country = resolve_country_code(town)
+        if country:
+            return 0, len(raw), CountryTown(country=country, town=None, postal_code=m.group(1))
         if town and not _contains_address_keyword(town): return 0, len(raw), CountryTown(country=None, town=town, postal_code=m.group(1))
 
 
@@ -659,6 +728,14 @@ def _extract_geo_from_free_lines(lines, warnings):
         if cc in COUNTRY_CODES:
             return CountryTown(country=cc, town=None, postal_code=m_country_postal.group(2).strip()), 1
 
+    # 4c. Postal + pays seul: 60311 DE
+    m_postal_country = re.match(r"^([A-Z0-9][A-Z0-9\- ]{2,10})\s+([A-Z]{2})$", last, flags=re.IGNORECASE)
+    if m_postal_country:
+        cc = m_postal_country.group(2).upper().strip()
+        postal = _norm(m_postal_country.group(1)).strip()
+        if cc in COUNTRY_CODES and re.search(r"\d", postal):
+            return CountryTown(country=cc, town=None, postal_code=postal), 1
+
     # 5. Pays connu (nom complet ou code)
     code = resolve_country_code(last)
     if code:
@@ -693,6 +770,18 @@ def _extract_geo_from_free_lines(lines, warnings):
         if up.endswith(suffix):
             town = _clean_town_value(last[:-len(suffix)].strip())
             return CountryTown(country=code, town=town or None, postal_code=None), 1 
+
+    # 6b. ✅ NOUVEAU: Format "VILLE CODE_ISO_PAYS" (ex: "NEW YORK US")
+    # Cela corrige le bug où "NEW YORK US" était parsé comme town="NEW" + postal="YORK"
+    m_town_country_code = re.match(r"^(.+?)\s+([A-Z]{2})$", last, flags=re.IGNORECASE)
+    if m_town_country_code:
+        potential_country = m_town_country_code.group(2).upper()
+        if potential_country in COUNTRY_CODES:
+            potential_town = _clean_town_value(_norm(m_town_country_code.group(1)))
+            # Validation: la ville doit avoir au moins 3 caractères et ne pas être un mot-clé d'adresse
+            if potential_town and not _contains_address_keyword(potential_town) and len(potential_town) >= 3:
+                warnings.append(f"town_country_code_pattern_matched:{potential_town}→{potential_country}")
+                return CountryTown(country=potential_country, town=potential_town, postal_code=None), 1
 
     # 7. Pays collé (TN...)
     embedded_country, cleaned_town = _split_embedded_country_prefix(last)

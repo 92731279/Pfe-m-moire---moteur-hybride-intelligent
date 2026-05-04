@@ -59,6 +59,8 @@ class CanonicalMeta(BaseModel):
     source_format: Optional[str] = None
     parse_confidence: float = 0.0
     warnings: List[str] = Field(default_factory=list)
+    warnings_before_slm: List[str] = Field(default_factory=list)
+    warnings_after_slm: List[str] = Field(default_factory=list)
     llm_signals: List[str] = Field(default_factory=list)
     fallback_used: bool = False
     rejected: bool = False

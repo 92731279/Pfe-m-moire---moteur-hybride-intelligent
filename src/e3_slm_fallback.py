@@ -650,7 +650,8 @@ Output:"""
                 logger.debug(f"[E3] Adresse backfillée par SLM: {clean_address_lines}")
         
         # 3. Pays (priorité si manquant ou différent de l'IBAN)
-        if slm_result.get('country'):
+        # ⚠️ Ne pas appliquer si la ville SLM a échoué la validation
+        if slm_result.get('country') and not slm_result.get('town') is None:
             if not party.country_town or not party.country_town.country:
                 party.country_town = CountryTown(
                     country=slm_result['country'],
@@ -668,39 +669,57 @@ Output:"""
                     logger.debug(f"[E3] Pays conservé (source structurée): {party.country_town.country}")
         
         # 4. Ville (priorité si manquante ou contient adresse)
+        # ⚠️ VALIDATION STRICTE POST-SLM: Rejeter si la validation échoue
         if slm_result.get('town'):
             current_town = party.country_town.town if party.country_town else ''
             slm_town = slm_result['town']
+            
+            # ✅ Ne appliquer la validation stricte que si la ville était manquante ou incertaine AVANT SLM
+            town_was_unconfirmed = not any(
+                "town_confirmed" in str(w) for w in _meta_get(party.meta, 'warnings', [])
+            )
+            
             validated_town, validation_reason = validate_slm_town(
                 party.country_town.country if party.country_town else None,
                 slm_town,
                 party.country_town.postal_code if party.country_town else None,
             )
 
-            if not validated_town:
+            if not validated_town and town_was_unconfirmed:
+                # ✅ STRICT: Ne pas appliquer - ajouter flag pour révision manuelle
+                # SEULEMENT si la ville était incertaine avant le SLM
                 logger.warning(
-                    f"[E3] Ville SLM rejetée par validation backend: {slm_town} ({validation_reason})"
+                    f"[E3] 🚫 Ville SLM REJETÉE (validation échouée): {slm_town} ({validation_reason})"
                 )
-                _meta_set(party.meta, 'warnings', list(_meta_get(party.meta, 'warnings', [])) + [
-                    f"slm_town_rejected_backend_validation:{validation_reason}"
-                ])
-                slm_result['town'] = None
+                # ✅ STRICT: Ne pas appliquer - ajouter flag pour révision manuelle
+                warnings_list = list(_meta_get(party.meta, 'warnings', []))
+                if f"slm_town_rejected_backend_validation:{validation_reason}" not in warnings_list:
+                    warnings_list.append(f"slm_town_rejected_backend_validation:{validation_reason}")
+                warnings_list.append('slm_validation_failed_strict')
+                _meta_set(party.meta, 'warnings', warnings_list)
+                _meta_set(party.meta, 'requires_manual_review', True)  # ✅ Forcer révision manuelle
+                slm_result['town'] = None  # NE PAS appliquer
+            elif not validated_town and not town_was_unconfirmed:
+                # La ville était DÉJÀ confirmée avant SLM, donc ignorer le résultat SLM
+                logger.info(f"[E3] Ville SLM ignorée (ville déjà confirmée): {current_town}")
+                slm_result['town'] = None  # NE PAS appliquer
             else:
+                # ✅ La validation a réussi
                 slm_town = validated_town
                 slm_result['town'] = validated_town
             
-            # Prendre le SLM si la ville actuelle contient des mots d'adresse ou est fausse
+            # Prendre le SLM seulement si la validation a RÉUSSI
             address_keywords = ['PO BOX', 'RUE', 'STREET', 'AVENUE', 'DEPT', 'DEPARTMENT']
             has_address_words = bool(current_town) and any(kw in current_town for kw in address_keywords)
             
-            # Priorité absolue au SLM pour corriger les villes
+            # ✅ STRICT: Appliquer SEULEMENT si validation a réussi (validated_town != None)
             if validated_town and (not current_town or current_town == "UNKNOWN" or has_address_words or len(slm_town) >= 3):
                 if not party.country_town:
                     party.country_town = CountryTown(country=None, town=slm_town, postal_code=None)
                 else:
                     party.country_town.town = slm_town
                 updated = True
-                logger.debug(f"[E3] Ville mise à jour par SLM: {slm_town} ({validation_reason})")
+                logger.debug(f"[E3] ✅ Ville mise à jour par SLM (validée): {slm_town}")
         
         # 5. Code postal
         if slm_result.get('postal_code'):
@@ -709,15 +728,20 @@ Output:"""
                 updated = True
         
         # Mise à jour des métadonnées
-        _meta_set(party.meta, 'llm_signals', ['slm_applied'])
+        slm_validation_failed = 'slm_validation_failed_strict' in _meta_get(party.meta, 'warnings', [])
+        
+        if not slm_validation_failed:
+            _meta_set(party.meta, 'llm_signals', ['slm_applied'])
+        else:
+            _meta_set(party.meta, 'llm_signals', ['slm_attempted_but_validation_failed'])
+            
         _meta_set(party.meta, 'fallback_used', True)
-        if slm_result.get('confidence'):
-            # Mix with actual confidence? Or just replace ? Since it's fallback let's put what SLM thinks.
-            # Convert if necessary
+        if slm_result.get('confidence') and not slm_validation_failed:
+            # ✅ STRICT: Ne mettre à jour la confiance que si validation a réussi
             _meta_set(party.meta, 'parse_confidence', float(slm_result['confidence']))
 
-        if updated:
-            # Augmenter légèrement la confiance si SLM a amélioré
+        if updated and not slm_validation_failed:
+            # Augmenter légèrement la confiance seulement si SLM a réussi
             current_confidence = _meta_get(party.meta, 'parse_confidence', 0.5)
             # 🚀 NOUVEAU: Boost massif si le SLM a reconstruit un message totalement cassé !
             if current_confidence <= 0.3 and party.name and party.country_town and party.country_town.town:
@@ -728,6 +752,12 @@ Output:"""
             _meta_set(party.meta, 'parse_confidence', new_conf)
             # Nettoyer les warnings résolus
             _meta_set(party.meta, 'warnings', self._clean_resolved_warnings(party))
+        elif slm_validation_failed:
+            # ❌ Si validation échouée, pénaliser la confiance au lieu de la booster
+            current_confidence = _meta_get(party.meta, 'parse_confidence', 0.5)
+            penalized_conf = max(0.4, current_confidence - 0.1)
+            logger.warning(f"[E3] Confiance pénalisée (SLM validation échouée): {current_confidence:.2f} → {penalized_conf:.2f}")
+            _meta_set(party.meta, 'parse_confidence', penalized_conf)
         
         return party
     
