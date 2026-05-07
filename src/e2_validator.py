@@ -191,11 +191,9 @@ def _validate_pass1_country_town(party: CanonicalParty) -> Tuple[str, str, bool,
     if GEONAMES_AVAILABLE and country and town_raw:
         is_valid, canonical, matched_via = validate_town_in_country(country, town_raw)
         if is_valid and matched_via and not is_town_literally_a_suburb:
-
-            if matched_via == "district_promotion":
-                chosen_town = canonical.upper() if canonical else town_raw
-            else:
-                chosen_town = _prefer_input_town_when_canonical_expands(town_raw, canonical)
+            # Conserver la forme fournie par l'utilisateur quand elle est valide,
+            # afin de respecter la conversion mot à mot dans l'UI.
+            chosen_town = town_raw or (canonical.upper() if canonical else town_raw)
                 
             _append_warning_once(warnings, f"pass1_town_confirmed_geonames:{matched_via}")
             if has_suburb_context:
@@ -420,18 +418,34 @@ def validate_party_semantics(party: CanonicalParty) -> CanonicalParty:
     if town and len(town) == 3 and town not in KNOWN_SHORT_TOWNS:
         _append_warning_once(warnings, f"pass2_town_suspiciously_short_3chars:{town}")
         party.meta.parse_confidence = min(party.meta.parse_confidence, 0.65)
-        # Trigger SLM fallback if confidence is low enough
         if party.meta.parse_confidence < 0.70:
             _append_warning_once(warnings, "pass2_short_town_requires_slm_verification")
-    
+
     # Pattern suspect: ville très courte (< 3 caractères)
     if town and len(town) < 3:
         _append_warning_once(warnings, f"pass2_town_critically_short_lt3:{town}")
         party.meta.parse_confidence = min(party.meta.parse_confidence, 0.55)
         _append_warning_once(warnings, "requires_manual_verification:critically_short_town")
 
+    # ── ESCALADE CONFLIT PAYS (détecté en E1, confirmé ici) ──────────────
+    # Si E1 a détecté un conflit pays dans le champ 3/ (ex: 3/JP/Taiwan),
+    # E2 pénalise la confiance et s'assure que requires_manual_review est levé.
+    has_country_conflict = any(
+        "country_conflict_in_field3" in str(w) or
+        "iban_country_3way_conflict" in str(w)
+        for w in warnings
+    )
+    if has_country_conflict:
+        # Pénalité confiance forte : le pays est fondamentalement ambigu
+        party.meta.parse_confidence = min(party.meta.parse_confidence, 0.50)
+        _append_warning_once(
+            warnings,
+            "pass2_country_conflict_confirmed:human_intervention_required"
+        )
+        party.meta.requires_manual_review = True
+
     # Pass 2
     address_results = _validate_pass2_address_lines(party, country, town, geo_coherent)
     party.address_validation = address_results
-    
+
     return party

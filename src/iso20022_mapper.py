@@ -8,6 +8,8 @@ from xml.dom import minidom
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 from src.models import CanonicalParty, FragmentedAddress, PartyIdentifier
+from src.reference_data import resolve_country_code
+from src.iso20022_validator import validate_iso20022_semantic, suggest_iso20022_fixes
 
 PRIVATE_PARTY_ID_CODES = {"ARNU", "CCPT", "NIDN", "SOSE", "TXID"}
 ORGANISATION_PARTY_ID_CODES = {"CUST", "DRLC", "EMPL"}
@@ -118,6 +120,8 @@ def _extract_original_structured_town(party: CanonicalParty) -> Optional[str]:
         candidate = _clean_text(parts[-1])
         if candidate:
             candidate = re.sub(r"^\d{3,10}\s+", "", candidate).strip()
+            if _looks_like_pseudo_locality(candidate):
+                return None
             return candidate
     return None
 
@@ -186,6 +190,94 @@ def _extract_structured_line3_details(party: CanonicalParty) -> Dict[str, Option
     return details
 
 
+def _looks_like_pseudo_locality(value: Optional[str]) -> bool:
+    cleaned = _clean_text(value)
+    if not cleaned:
+        return False
+    
+    # Filtrer les codes postaux: si c'est majoritairement numérique, c'est pas une localité
+    if re.fullmatch(r"^\d[\d\s\-]*$", cleaned.strip()):
+        return True  # C'est un code postal, pas une localité
+
+    upper = cleaned.upper()
+    if re.match(r"^\d", upper):
+        return True
+
+    if any(keyword in upper for keyword in {"RUE", "AVENUE", "AVE", "ROAD", "WAY", "BOULEVARD", "BLVD", "STREET", "STRASSE", "ZONE", "INDUSTRIELLE"}):
+        return True
+
+    tokens = cleaned.split()
+    if len(tokens) < 2:
+        return False
+
+    country = resolve_country_code(tokens[0])
+    if not country:
+        return False
+
+    remainder = " ".join(tokens[1:]).strip()
+    if not remainder:
+        return True
+
+    if re.fullmatch(r"[A-Z0-9][A-Z0-9\-/ ]*", remainder) and not re.search(r"[A-Z]{3,}", remainder):
+        return True
+
+    return False
+
+
+def _extract_original_locality_from_raw(party: CanonicalParty, canonical_town: Optional[str]) -> Optional[str]:
+    raw = getattr(party, "raw", None)
+    if not raw or not canonical_town:
+        return None
+
+    town_n = _clean_text(canonical_town)
+    if not town_n:
+        return None
+
+    town_upper = town_n.upper()
+    for line in str(raw).splitlines():
+        cleaned = _clean_text(line)
+        if not cleaned:
+            continue
+        upper = cleaned.upper()
+        if town_upper not in upper:
+            continue
+
+        left = upper.split(town_upper, 1)[0].rstrip(" ,;-/")
+        if not left:
+            continue
+
+        if "," in left:
+            candidate = left.split(",")[-1].strip()
+        elif "/" in left:
+            candidate = left.split("/")[-1].strip()
+        else:
+            candidate = left.strip()
+
+        candidate = _clean_text(candidate)
+        if not candidate or candidate.upper() == town_upper:
+            continue
+
+        candidate_upper = candidate.upper()
+        if any(keyword in candidate_upper for keyword in {"RUE", "AVENUE", "AVE", "ROAD", "WAY", "BOULEVARD", "BLVD", "STREET", "STRASSE", "ZONE", "INDUSTRIELLE"}):
+            continue
+
+        if re.search(r"\d", candidate_upper):
+            continue
+
+        if len(candidate_upper.split()) < 2:
+            continue
+
+        if candidate_upper.startswith(tuple(str(n) for n in range(10))):
+            continue
+
+        if candidate and candidate_upper != town_upper:
+            if _looks_like_pseudo_locality(candidate):
+                continue
+            return candidate
+
+    return None
+
+
 def _is_redundant_locality(locality: Optional[str], town: Optional[str], sub_div: Optional[str], postal: Optional[str]) -> bool:
     if not locality or not town:
         return False
@@ -245,9 +337,31 @@ def _build_postal_address(party: CanonicalParty) -> Dict[str, Any]:
     geo = party.country_town
     address_lines = _clean_list(party.address_lines)
     postal_complement = _clean_text(getattr(party, "postal_complement", None))
-    original_town = _extract_original_structured_town(party)
-    line3_details = _extract_structured_line3_details(party)
     canonical_town = _clean_text(getattr(geo_fragment, "twn_nm", None) or (geo.town if geo else None))
+    original_town = _extract_original_structured_town(party)
+    if not original_town:
+        original_town = _extract_original_locality_from_raw(party, canonical_town)
+    # Also try to recover an original locality token from unstructured address lines
+    # Example: "TAFO, KUMASI" -> original_town = "TAFO"
+    if not original_town and canonical_town and address_lines:
+        for line in address_lines:
+            if not line:
+                continue
+            line_up = _clean_text(line).upper()
+            if canonical_town and canonical_town.upper() in line_up:
+                # take substring before canonical_town
+                parts = line_up.split(canonical_town.upper(), 1)
+                left = parts[0].rstrip(' ,;-')
+                if left:
+                    # if left contains a comma-separated token, take the last token (nearest locality)
+                    if ',' in left:
+                        cand = left.split(',')[-1].strip()
+                    else:
+                        cand = left.strip()
+                    if cand:
+                        original_town = cand
+                        break
+    line3_details = _extract_structured_line3_details(party)
 
     if postal_complement and postal_complement not in address_lines:
         address_lines.append(postal_complement)
@@ -316,6 +430,8 @@ def _build_postal_address(party: CanonicalParty) -> Dict[str, Any]:
             else _clean_text(original_town)
         )
     )
+    if _looks_like_pseudo_locality(inferred_locality):
+        inferred_locality = None
     if _is_redundant_locality(inferred_locality, canonical_town, ctry_sub_div, pst_cd):
         inferred_locality = None
         
@@ -350,6 +466,12 @@ def _build_postal_address(party: CanonicalParty) -> Dict[str, Any]:
             "Ctry": ctry,
             "AdrLine": [line for line in filtered_address_lines if line],
         }
+        # If the address is effectively structured (we have a town AND at least one
+        # of PO Box / building name / building number / street / room), avoid keeping
+        # redundant unstructured AdrLine entries.
+        structured_indicators = any([pst_bx, bldg_nm, bldg_nb, strt_nm, room])
+        if canonical_town and structured_indicators:
+            postal_address["AdrLine"] = []
     else:
         # Graceful degradation to Unstructured Address if minimum requirements are not met
         original_lines = _clean_list(party.address_lines)
@@ -455,6 +577,9 @@ def build_iso20022_party_payload(party: CanonicalParty) -> Dict[str, Any]:
     postal_address = _build_postal_address(party)
     country_of_residence = _clean_text(party.country_town.country if party.country_town else None)
 
+    if postal_address.get("TwnLctnNm") and _looks_like_pseudo_locality(postal_address.get("TwnLctnNm")):
+        postal_address.pop("TwnLctnNm", None)
+
     payload: Dict[str, Any] = {}
     if name:
         payload["Nm"] = name
@@ -533,11 +658,54 @@ def validate_iso20022_party_payload(payload: Dict[str, Any]) -> List[str]:
     return errors
 
 
+def build_iso20022_party_xml_full(
+    party: CanonicalParty,
+    role_tag: Optional[str] = None,
+    include_envelope: bool = False,
+) -> Tuple[str, Dict[str, Any], List[str], Dict[str, List[str]]]:
+    """
+    Génère le XML ISO 20022 avec validation sémantique COMPLÈTE.
+    
+    Returns:
+        (xml_string, payload, basic_errors, semantic_validation)
+        où semantic_validation = {'errors': [...], 'warnings': [...]}
+    """
+    payload = build_iso20022_party_payload(party)
+    basic_errors = validate_iso20022_party_payload(payload)
+    semantic_validation = validate_iso20022_semantic(party, payload)
+
+    role = role_tag or ("Dbtr" if party.role == "debtor" else "Cdtr")
+
+    if include_envelope:
+        root = Element("Document")
+        fitofi = SubElement(root, "FIToFICstmrCdtTrf")
+        tx = SubElement(fitofi, "CdtTrfTxInf")
+        role_node = SubElement(tx, role)
+    else:
+        root = Element(role)
+        role_node = root
+
+    for key, value in payload.items():
+        _append_xml(role_node, key, value)
+
+    xml_bytes = tostring(root, encoding="utf-8")
+    xml_pretty = minidom.parseString(xml_bytes).toprettyxml(indent="  ")
+    
+    # Combiner tous les erreurs (basiques + sémantiques)
+    all_errors = basic_errors + semantic_validation.get("errors", [])
+    
+    return xml_pretty, payload, all_errors, semantic_validation
+
+
 def build_iso20022_party_xml(
     party: CanonicalParty,
     role_tag: Optional[str] = None,
     include_envelope: bool = False,
 ) -> Tuple[str, Dict[str, Any], List[str]]:
+    """
+    Génère le XML ISO 20022 (rétrocompatible - retourne 3 éléments).
+    Pour la validation complète, utilisez build_iso20022_party_xml_full().
+    """
     payload = build_iso20022_party_payload(party)
     errors = validate_iso20022_party_payload(payload)
 

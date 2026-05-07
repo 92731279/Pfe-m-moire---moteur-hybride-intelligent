@@ -5,6 +5,7 @@ CORRECTIONS :
 - Reclassification "house" -> "suburb" pour ZONE/CITE
 """
 from typing import Dict, List, Optional
+from src.reference_data import CITIES_BY_COUNTRY
 
 def _normalize_label(text: Optional[str]) -> str:
     """Normalise les labels libpostal (road, house, suburb...) → Clés MAJUSCULES sans espaces"""
@@ -39,6 +40,8 @@ def parse_address_line(address_line: str) -> Dict:
     
     corrected_parsed = []
     n_parsed = len(parsed)
+    # Build a set of known city tokens for a quick membership test (UPPERCASE)
+    _KNOWN_CITIES = {c.strip().upper() for cities in CITIES_BY_COUNTRY.values() for c in (cities or [])}
     for i, (value, label) in enumerate(parsed):
         val_upper = value.upper()
         # Éviter les "CITY: ZONE" et "COUNTRY: IND." (blacklist de bruits géographiques)
@@ -50,7 +53,16 @@ def parse_address_line(address_line: str) -> Dict:
         elif label == "house" and any(kw in val_upper for kw in NON_HOUSE_KEYWORDS):
             corrected_parsed.append((value, "suburb"))
         else:
-            corrected_parsed.append((value, label))
+            # If libpostal labelled a fragment as 'house' but it matches a known city token,
+            # reclassify it as a city to avoid leaving town tokens as building names.
+            if label == "house":
+                tokens = [t.strip().upper() for t in val_upper.replace("/", " ").split() if t.strip()]
+                if any(t in _KNOWN_CITIES for t in tokens):
+                    corrected_parsed.append((value, "city"))
+                else:
+                    corrected_parsed.append((value, label))
+            else:
+                corrected_parsed.append((value, label))
 
     # Construction du dictionnaire de composants
     components: Dict[str, List[str]] = {}

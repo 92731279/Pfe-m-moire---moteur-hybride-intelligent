@@ -4,7 +4,7 @@ import re
 import unicodedata
 from typing import Optional
 
-from src.config import ADDRESS_KEYWORDS, NOISE_PREFIXES, ORG_HINTS
+from src.config import ADDRESS_KEYWORDS, NOISE_PREFIXES, ORG_HINTS, ABBREVIATION_MAP
 from src.logger import StepLogger
 from src.models import PreprocessMeta, PreprocessResult
 
@@ -45,19 +45,14 @@ def _extract_iban_country(text: str) -> Optional[str]:
 
 
 def _remove_noise_lines(lines: list, meta: PreprocessMeta, log: StepLogger) -> list:
-    kept = []
     for line in lines:
         upper = line.upper()
-        is_noise = False
         for prefix in NOISE_PREFIXES:
             if upper.startswith(prefix):
                 meta.removed_noise_lines.append(line)
                 log.warn(f"Ligne de bruit supprimée: {line}")
-                is_noise = True
                 break
-        if not is_noise:
-            kept.append(line)
-    return kept
+    return lines
 
 
 def _deduplicate_structured_lines(lines: list, meta: PreprocessMeta, log: StepLogger) -> list:
@@ -127,6 +122,19 @@ def preprocess(raw_input: str, logger: Optional[StepLogger] = None) -> Preproces
 
     lines = [line for line in text.split("\n") if line.strip()]
     log.ok(f"Lignes après normalisation: {len(lines)}")
+
+    # Expand common abbreviations (e.g. Z.I. -> ZONE INDUSTRIELLE) per config
+    def _expand_abbreviations_in_line(line: str) -> str:
+        if not line:
+            return line
+        out = line
+        for abbr, full in ABBREVIATION_MAP.items():
+            # replace case-insensitive, accept variants with/without dots
+            pattern = re.compile(rf"\b{re.escape(abbr)}\b", flags=re.IGNORECASE)
+            out = pattern.sub(full, out)
+        return out
+
+    lines = [_expand_abbreviations_in_line(l) for l in lines]
 
     meta.iban_country = _extract_iban_country(text)
     if meta.iban_country:

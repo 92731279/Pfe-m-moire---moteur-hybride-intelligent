@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 
 from src.geonames.geonames_db import infer_city_from_postal_code
 from src.geonames.geonames_validator import validate_town_in_country
-from src.toponym_normalizer import toponyms_equivalent
+from src.toponym_normalizer import reduce_to_known_core_toponym, toponyms_equivalent
 
 
 def validate_slm_town(
@@ -38,11 +38,15 @@ def validate_slm_town(
         canonical_postal_city = infer_city_from_postal_code(country, postal)
         if canonical_postal_city:
             if toponyms_equivalent(candidate, canonical_postal_city):
-                return canonical_postal_city.upper(), "postal_match"
+                return candidate.upper(), "postal_match"
+            candidate_core = reduce_to_known_core_toponym(country, candidate)
+            postal_core = reduce_to_known_core_toponym(country, canonical_postal_city)
+            if candidate_core and postal_core and toponyms_equivalent(candidate_core, postal_core):
+                return candidate.upper(), "postal_match_core"
             return None, f"postal_mismatch:{canonical_postal_city}"
 
     is_valid, canonical, matched_via = validate_town_in_country(country, candidate)
     if is_valid and canonical:
-        return canonical.upper(), f"geonames:{matched_via or 'unknown'}"
+        return candidate.upper(), f"geonames:{matched_via or 'unknown'}"
 
     return None, "not_geonames"

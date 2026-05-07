@@ -112,6 +112,44 @@ def _get_comp(components: Dict[str, Any], *keys: str) -> Optional[str]:
             return val if isinstance(val, str) else (val[0] if isinstance(val, list) and val else None)
     return None
 
+
+def _parse_zone_industrielle_line(line: str) -> Optional[FragmentedAddress]:
+    raw = (line or "").strip()
+    if not raw:
+        return None
+
+    normalized = re.sub(r"\s+", " ", raw.upper())
+    normalized = normalized.replace("Z.I.", "ZONE INDUSTRIELLE")
+    normalized = normalized.replace("Z.I", "ZONE INDUSTRIELLE")
+    normalized = normalized.replace("ZI", "ZONE INDUSTRIELLE")
+
+    match = re.match(r"^(ZONE INDUSTRIELLE)\s+(.+?)(?:\s+(\d+[A-Z0-9/-]*))?$", normalized)
+    if not match:
+        return None
+
+    zone_label = match.group(1).strip()
+    zone_name = (match.group(2) or "").strip()
+    building_nb = (match.group(3) or None)
+
+    if not zone_name:
+        return None
+
+    zone_text = f"{zone_label} {zone_name}".strip()
+    return FragmentedAddress(
+        strt_nm=None,
+        bldg_nb=building_nb,
+        bldg_nm=None,
+        flr=None,
+        room=None,
+        pst_cd=None,
+        twn_nm=None,
+        ctry_sub_div=zone_text,
+        ctry=None,
+        adr_line=[raw],
+        fragmentation_confidence=0.9,
+        fallback_used=False,
+    )
+
 def _map_libpostal_to_iso(
     components: Dict[str, Any],
     country_hint: Optional[str] = None,
@@ -162,6 +200,16 @@ def _fragment_single_line(
     postal_code_hint: Optional[str] = None,
     town_hint: Optional[str] = None,
 ) -> FragmentedAddress:
+    zone_fragment = _parse_zone_industrielle_line(line)
+    if zone_fragment:
+        if not zone_fragment.pst_cd:
+            zone_fragment.pst_cd = _safe_hint(postal_code_hint)
+        if not zone_fragment.twn_nm:
+            zone_fragment.twn_nm = _safe_hint(town_hint)
+        if country_hint and not zone_fragment.ctry:
+            zone_fragment.ctry = country_hint.upper()
+        return zone_fragment
+
     chinese_fragment = _extract_chinese_fragment(line, country_hint)
     if chinese_fragment:
         if not chinese_fragment.pst_cd:

@@ -30,6 +30,13 @@ NOISE_PREFIXES = {
     "ATTN", "ATTN:", "C/O", "C/O:", "A L ATTENTION DE",
 }
 
+# Abbreviations normalization map (uppercase keys)
+ABBREVIATION_MAP = {
+    "Z.I.": "ZONE INDUSTRIELLE",
+    "ZI": "ZONE INDUSTRIELLE",
+    "Z I": "ZONE INDUSTRIELLE",
+    "Z.I": "ZONE INDUSTRIELLE",
+}
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:0.5b")  # Changé de phi3:mini à qwen2.5:0.5b (plus léger)
 # Augmenter le timeout

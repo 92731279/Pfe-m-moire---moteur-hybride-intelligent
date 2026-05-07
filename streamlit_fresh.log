@@ -1,0 +1,15 @@
+
+  You can now view your Streamlit app in your browser.
+
+  Local URL: http://localhost:8501
+  Network URL: http://172.31.107.214:8501
+
+gio: http://localhost:8501: Operation not supported
+[E3] Connection error via http://127.0.0.1:11434: HTTPConnectionPool(host='127.0.0.1', port=11434): Max retries exceeded with url: /api/generate (Caused by NewConnectionError("HTTPConnection(host='127.0.0.1', port=11434): Failed to establish a new connection: [Errno 111] Connection refused"))
+[E3] Connection error via http://localhost:11434: HTTPConnectionPool(host='localhost', port=11434): Max retries exceeded with url: /api/generate (Caused by NewConnectionError("HTTPConnection(host='localhost', port=11434): Failed to establish a new connection: [Errno 111] Connection refused"))
+[E3] 🚫 Ville SLM REJETÉE (validation échouée): ARIANA (not_geonames)
+[E3] Confiance pénalisée (SLM validation échouée): 0.60 → 0.50
+[E3] Connection error via http://127.0.0.1:11434: HTTPConnectionPool(host='127.0.0.1', port=11434): Max retries exceeded with url: /api/generate (Caused by NewConnectionError("HTTPConnection(host='127.0.0.1', port=11434): Failed to establish a new connection: [Errno 111] Connection refused"))
+[E3] Connection error via http://localhost:11434: HTTPConnectionPool(host='localhost', port=11434): Max retries exceeded with url: /api/generate (Caused by NewConnectionError("HTTPConnection(host='localhost', port=11434): Failed to establish a new connection: [Errno 111] Connection refused"))
+✅ GeoNames disponible pour validation
+  Stopping...

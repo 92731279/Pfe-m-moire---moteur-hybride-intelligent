@@ -1,7 +1,7 @@
 """models.py — Structures de données canoniques du moteur hybride SWIFT"""
 
 from typing import Dict, List, Optional
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, computed_field
 
 
 # ============================================================
@@ -96,6 +96,12 @@ class CanonicalParty(BaseModel):
     
     # 🔹 NOUVEAU : Résultat de la fragmentation E2.5
     fragmented_addresses: List["FragmentedAddress"] = Field(default_factory=list)
+    
+    @computed_field
+    @property
+    def full_name(self) -> str:
+        """Retourne le nom complet concatené des lignes."""
+        return " ".join(self.name) if self.name else ""
 
 
 # ============================================================

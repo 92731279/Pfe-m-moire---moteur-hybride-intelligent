@@ -176,6 +176,16 @@ def load_cases():
 cases = load_cases()
 options = {f"{c['label']}": c["raw_message"] for c in cases}
 
+
+def render_selected_case_preview(dataset_choice):
+    if dataset_choice:
+        st.text_area(
+            "Message à traiter",
+            value=options[dataset_choice],
+            height=160,
+            disabled=True,
+        )
+
 # ─────────────────────────────────────────────
 # NAVIGATION & ROUTING
 # ─────────────────────────────────────────────
@@ -203,6 +213,7 @@ if page == "Mode Avancé (Démo Initiale)":
     with col1:
         st.markdown("### 📥 Entrée SWIFT")
         dataset_choice = st.selectbox("Sélectionner un cas de test", options=list(options.keys()))
+        render_selected_case_preview(dataset_choice)
         
         if dataset_choice:
             default_val = options[dataset_choice]
@@ -336,6 +347,7 @@ elif page == "Mode Démo Simple (Validation)":
         st.markdown("### 📥 Saisie du SWIFT MT103")
         dataset_choice = st.selectbox("Sélectionner un cas de test (Démo)", options=list(options.keys()))
         default_val = options[dataset_choice] if dataset_choice else ":59:/TN123456\nNOM PRENOM\nADRESSE\nVILLE PAYS"
+        render_selected_case_preview(dataset_choice)
         raw_message = st.text_area("Message SWIFT Brut", value=default_val, height=200)
         run_simple = st.button("▶️ EXTRAIRE LE JSON")
 

@@ -322,3 +322,30 @@ def test_iso_mapper_parses_canada_postal_and_province_from_structured_line3():
     assert payload["PstlAdr"]["CtrySubDvsn"] == "ON"
     assert payload["PstlAdr"]["PstCd"] == "M5H 2N2"
     assert "TwnLctnNm" not in payload["PstlAdr"]
+
+
+def test_iso_mapper_omits_pseudo_locality_country_plus_postal_code():
+    party = CanonicalParty(
+        message_id="ISO_010",
+        field_type="59F",
+        role="creditor",
+        raw="\n".join(
+            [
+                "/TN5925048000000102575734",
+                "1/FLEN BEN FLEN",
+                "2/TUNIS",
+                "3/TN/TN 8090",
+            ]
+        ),
+        name=["FLEN BEN FLEN"],
+        address_lines=["TUNIS"],
+        country_town=CountryTown(country="TN", town="TUNIS", postal_code="8090"),
+        is_org=False,
+        meta=CanonicalMeta(source_format="59F", parse_confidence=1.0),
+    )
+
+    payload = build_iso20022_party_payload(party)
+
+    assert payload["PstlAdr"]["TwnNm"] == "TUNIS"
+    assert payload["PstlAdr"]["PstCd"] == "8090"
+    assert "TwnLctnNm" not in payload["PstlAdr"]

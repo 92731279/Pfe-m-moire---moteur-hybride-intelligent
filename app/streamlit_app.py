@@ -18,7 +18,7 @@ if PROJECT_ROOT not in sys.path:
 
 from src.pipeline import run_pipeline
 from src.pipeline_logger import PipelineLogger
-from src.iso20022_mapper import build_iso20022_party_xml
+from src.iso20022_mapper import build_iso20022_party_xml, build_iso20022_party_xml_full
 from src.swift_message_parser import extract_party_fields, extract_swift_fields
 import src.pipeline as pipeline_module
 
@@ -39,6 +39,13 @@ def compute_geo_reliability(result):
         score -= 0.05 
         
     return max(0.0, score)
+
+
+def _display_name(result):
+    full_name = getattr(result, "full_name", None)
+    if full_name:
+        return full_name
+    return " ".join(result.name or []) if getattr(result, "name", None) else "-"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIG PAGE
@@ -964,7 +971,7 @@ def render_result_card(result, elapsed: float):
     postal = result.country_town.postal_code if result.country_town and result.country_town.postal_code else '-'
     town = result.country_town.town if result.country_town and result.country_town.town else '-'
     country = result.country_town.country if result.country_town and result.country_town.country else '-'
-    name = result.name[0] if result.name and result.name[0] else '-'
+    name = _display_name(result)
     addr = ' '.join(result.address_lines) if result.address_lines else '-'
 
     return textwrap.dedent(f'''
@@ -1119,6 +1126,17 @@ def load_cases():
 
 cases = load_cases()
 options = {f"{c['label']}": c["raw_message"] for c in cases}
+
+
+def render_selected_case_preview(dataset_choice):
+    if dataset_choice:
+        st.text_area(
+            "Message à traiter",
+            value=options[dataset_choice],
+            height=160,
+            disabled=True,
+            key=f"selected_case_preview_{re.sub(r'[^a-z0-9]+', '_', dataset_choice.lower()).strip('_')}",
+        )
 
 
 def _safe_dump_model(obj):
@@ -1281,7 +1299,7 @@ def _build_display_json(result):
         "role_metier": party_context["party_label"],
         party_context["account_key"]: result.account,
         "identifiant_partie": _safe_dump_model(result.party_id) if result.party_id else None,
-        party_context["name_key"]: result.name,
+        party_context["name_key"]: _display_name(result),
         party_context["type_key"]: _party_type_label(result.is_org),
         party_context["address_key"]: result.address_lines,
         "localisation": {
@@ -1333,6 +1351,15 @@ def _run_case(raw_message: str, message_id: str = "UI_CASE", slm_model: str = "q
     elapsed = round(time.time() - start, 3)
     iso_xml, iso_payload, iso_errors = build_iso20022_party_xml(result, include_envelope=True)
     return result, logger, elapsed, iso_xml, iso_payload, iso_errors
+
+
+def _build_iso_semantic_validation(result):
+    """Build ISO 20022 artifacts plus semantic validation without breaking legacy callers."""
+    iso_xml, iso_payload, iso_errors, semantic_validation = build_iso20022_party_xml_full(
+        result,
+        include_envelope=True,
+    )
+    return iso_xml, iso_payload, iso_errors, semantic_validation
 
 
 def _run_case_without_slm(raw_message: str, message_id: str = "UI_CASE_NO_SLM"):
@@ -1459,6 +1486,7 @@ if page == "🚀 Mode Avancé":
                 dataset_choice = st.selectbox("Cas de test", options=list(options.keys()), label_visibility="collapsed")
                 raw_message = options[dataset_choice] if dataset_choice else ""
                 st.info(f"✓ Cas sélectionné: {dataset_choice}")
+                render_selected_case_preview(dataset_choice)
             
             elif input_source == "📂 Importer un fichier":
                 uploaded_file = st.file_uploader("Choisir un fichier SWIFT", type=["txt", "swift", "msg", ""], label_visibility="collapsed")
@@ -1622,7 +1650,7 @@ if page == "🚀 Mode Avancé":
                             st.json(_display_fragment_json(f))
                             st.markdown('</div>', unsafe_allow_html=True)
 
-            iso_xml, iso_payload, iso_errors = build_iso20022_party_xml(result, include_envelope=True)
+            iso_xml, iso_payload, iso_errors, semantic_validation = _build_iso_semantic_validation(result)
             with t5:
                 with st.container():
                     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
@@ -1636,6 +1664,14 @@ if page == "🚀 Mode Avancé":
                         st.warning("Validation ISO incomplète: " + " | ".join(iso_errors))
                     else:
                         st.success("XML ISO 20022 bien formé")
+                    semantic_errors = semantic_validation.get("errors", [])
+                    semantic_warnings = semantic_validation.get("warnings", [])
+                    if semantic_errors:
+                        st.error("Validation sémantique ISO: " + " | ".join(semantic_errors))
+                    elif semantic_warnings:
+                        st.warning("Avertissements sémantiques ISO: " + " | ".join(semantic_warnings))
+                    else:
+                        st.success("Validation sémantique ISO: OK")
                     st.code(iso_xml, language="xml")
                     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1718,12 +1754,13 @@ elif page == "🧾 Message SWIFT complet":
                         raw_party,
                         message_id=f"FULL_SWIFT_{party_field['tag']}_{idx:02d}",
                     )
+                    _, _, _, semantic_validation = _build_iso_semantic_validation(result)
                     geo = result.country_town
                     summary_rows.append({
                         "role": party_field["role_label"],
                         "tag": party_field["tag"],
                         "account": result.account,
-                        "name": " | ".join(result.name or []),
+                        "name": _display_name(result),
                         "town": geo.town if geo else None,
                         "country": geo.country if geo else None,
                         "confidence": round(float(getattr(result.meta, "parse_confidence", 0.0) or 0.0), 3),
@@ -1749,6 +1786,14 @@ elif page == "🧾 Message SWIFT complet":
                     with details_c:
                         if iso_errors:
                             st.warning("Validation ISO incomplète: " + " | ".join(iso_errors))
+                        semantic_errors = semantic_validation.get("errors", [])
+                        semantic_warnings = semantic_validation.get("warnings", [])
+                        if semantic_errors:
+                            st.error("Validation sémantique ISO: " + " | ".join(semantic_errors))
+                        elif semantic_warnings:
+                            st.warning("Avertissements sémantiques ISO: " + " | ".join(semantic_warnings))
+                        else:
+                            st.success("Validation sémantique ISO: OK")
                         st.code(iso_xml, language="xml")
 
             st.markdown('<div class="section-title">📌 Synthèse</div>', unsafe_allow_html=True)
@@ -1796,6 +1841,7 @@ elif page == "✅ Mode Validation":
                 dataset_choice = st.selectbox("Cas de test", options=list(options.keys()), label_visibility="collapsed")
                 raw_message = options[dataset_choice] if dataset_choice else ""
                 st.info(f"✓ Cas sélectionné: {dataset_choice}")
+                render_selected_case_preview(dataset_choice)
             
             elif input_source == "📂 Importer un fichier":
                 uploaded_file = st.file_uploader("Choisir un fichier SWIFT", type=["txt", "swift", "msg", ""], label_visibility="collapsed")
@@ -1820,13 +1866,14 @@ elif page == "✅ Mode Validation":
             with st.spinner(""):
                 result, _ = run_pipeline(raw_message=raw_message, message_id="DEMO", logger=SilentLogger())
                 geo_score = compute_geo_reliability(result)
-                iso_xml, iso_payload, iso_errors = build_iso20022_party_xml(result, include_envelope=True)
+                iso_xml, iso_payload, iso_errors, semantic_validation = _build_iso_semantic_validation(result)
 
                 clean_json = {"ACCOUNT": result.account}
                 if result.party_id:
                     clean_json["PARTY_ID"] = getattr(result.party_id, "identifier", str(result.party_id))
                 clean_json.update({
-                    "NAME": result.name,
+                    "NAME": _display_name(result),
+                    "NAME_LINES": result.name,
                     "ADDRESS_LINES": result.address_lines,
                     "COUNTRY": result.country_town.country if result.country_town else None,
                     "TOWN_NAME": result.country_town.town if result.country_town else None,
@@ -1882,6 +1929,14 @@ elif page == "✅ Mode Validation":
                         st.warning("Validation ISO incomplète: " + " | ".join(iso_errors))
                     else:
                         st.success("XML généré avec succès")
+                    semantic_errors = semantic_validation.get("errors", [])
+                    semantic_warnings = semantic_validation.get("warnings", [])
+                    if semantic_errors:
+                        st.error("Validation sémantique ISO: " + " | ".join(semantic_errors))
+                    elif semantic_warnings:
+                        st.warning("Avertissements sémantiques ISO: " + " | ".join(semantic_warnings))
+                    else:
+                        st.success("Validation sémantique ISO: OK")
                     st.code(iso_xml, language="xml")
                     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -2047,7 +2102,7 @@ elif page == "🧠 Avant/Après SLM":
 
         def _fields_view(r):
             return {
-                "name": " | ".join(r.name or []),
+                "name": _display_name(r),
                 "address": " | ".join(r.address_lines or []),
                 "town": r.country_town.town if r.country_town else None,
                 "country": r.country_town.country if r.country_town else None,

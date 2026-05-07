@@ -24,10 +24,15 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 class OllamaCircuitBreaker:
-    """Circuit breaker simple pour protéger contre les surcharges Ollama."""
+    """Circuit breaker simple pour protéger contre les surcharges Ollama.
     
-    def __init__(self, failure_threshold: int = 3, recovery_timeout: int = 30):
-        self.failure_threshold = failure_threshold  # Nombre d'erreurs avant de ouvrir
+    OPTIMISÉ: Compte les failures globales mais nécessite plusieurs retries
+    avant de se fermer (threshold=6) pour laisser le temps aux fallback endpoints
+    de s'exécuter. Récupération rapide après 15s au lieu de 30s.
+    """
+    
+    def __init__(self, failure_threshold: int = 6, recovery_timeout: int = 15):
+        self.failure_threshold = failure_threshold  # Nombre d'erreurs avant de ouvrir (6 = 2 retries × 3 endpoints)
         self.recovery_timeout = recovery_timeout    # Secondes avant retry après fermeture
         self.failure_count = 0
         self.last_failure_time = None
@@ -65,7 +70,7 @@ class OllamaCircuitBreaker:
         return False
 
 
-_ollama_circuit_breaker = OllamaCircuitBreaker(failure_threshold=2, recovery_timeout=20)
+_ollama_circuit_breaker = OllamaCircuitBreaker(failure_threshold=6, recovery_timeout=15)
 
 
 def _meta_get(meta: Any, field: str, default: Any = None) -> Any:
@@ -210,7 +215,7 @@ class SLMCache:
     def _get_key(self, text: str) -> str:
         """Génère une clé de cache"""
         # Ajout d'une version pour forcer l'invalidation de l'ancien cache corrompu
-        return hashlib.md5((text + "_v3_cache_invalidation").encode()).hexdigest()[:16]
+        return hashlib.md5((text + "_v4_word_for_word_preservation").encode()).hexdigest()[:16]
     
     def get(self, text: str) -> Optional[Dict[str, Any]]:
         """Récupère du cache"""
@@ -389,6 +394,8 @@ class E3SLMFallback:
         endpoint_candidates = list(get_ollama_base_urls())
         if self.ollama_url and self.ollama_url not in endpoint_candidates:
             endpoint_candidates.insert(0, self.ollama_url.rstrip("/"))
+
+        logger.info(f"[E3] Essai SLM - endpoints à tenter: {endpoint_candidates}")
 
         for attempt in range(self.max_retries):
             try:
@@ -617,12 +624,20 @@ Output:"""
             slm_name = slm_result['name']
             current_country = party.country_town.country if party.country_town else None
             
+            # Vérifier si on a déjà un nom divisé en plusieurs lignes (reverse layout) - word-for-word preservation
+            has_multi_line_name = len(party.name or []) >= 2
+            has_reverse_layout = "reverse_layout_postal_city_name_detected" in [str(w) for w in party.meta.warnings]
+            
             # Prendre prioritairement le nom du SLM si c'est un format 50K bruités ou si E1 a fusionné par erreur
+            # SAUF si on a déjà un nom divisé en plusieurs lignes (word-for-word preservation)
             warnings_list = [str(w) for w in party.meta.warnings]
-            if party.field_type == "50K" or "town_missing_from_name_country_pattern" in warnings_list:
+            if (party.field_type == "50K" or "town_missing_from_name_country_pattern" in warnings_list) and not (has_reverse_layout and has_multi_line_name):
                 party.name = [slm_name]
                 updated = True
                 logger.debug(f"[E3] Nom forcé par l'IA en raison du contexte : {slm_name}")
+            elif (party.field_type == "50K" and has_reverse_layout and has_multi_line_name):
+                # Préserver le nom divisé en lignes multiples (word-for-word)
+                logger.debug(f"[E3] Nom multilignes préservé (reverse layout): {party.name}")
             elif _name_just_appends_same_country(current_name, slm_name, current_country):
                 pass
             elif current_name == "UNKNOWN" or len(slm_name) >= len(current_name) - 3 or not current_name:

@@ -14,6 +14,7 @@ from src.reference_data import (
     COUNTRY_NAME_TO_CODE, COUNTRY_CODES, ADDRESS_KEYWORDS, ORG_HINTS,
     PARTY_ID_PREFIXES, CITIES_BY_COUNTRY, CAPITALS, resolve_country_code,
 )
+from src.config import NOISE_PREFIXES
 from src.ambiguity_resolver import resolve_city_country_ambiguity
 from src.geonames.geonames_validator import validate_town_in_country
 
@@ -396,12 +397,20 @@ def _looks_like_org_continuation(line):
     return False
 
 def _parse_structured_country_town(value):
+    """
+    Parse une ligne 3/CC/TownName du format 50F/59F.
+
+    Retourne (CountryTown, ok, conflict_dict) où conflict_dict peut contenir :
+      - "town_is_country"   : le town est en réalité un alias pays
+      - "country_resolved"  : le code pays résolu depuis le town
+      - "declared_country"  : le code pays déclaré dans le champ 3/
+    """
     raw = _norm(value)
     parts = [p.strip() for p in raw.split("/")]
-    if len(parts) == 1: return None, False
+    if len(parts) == 1: return None, False, {}
     country = parts[0].upper()
     rest = parts[1]
-    if country not in COUNTRY_CODES: return None, False
+    if country not in COUNTRY_CODES: return None, False, {}
     postal_code = None
     town = rest
     m = re.match(r"^(\d{3,10})\s+(.+)$", rest)
@@ -415,14 +424,27 @@ def _parse_structured_country_town(value):
             postal_code = m.group(2).strip()
 
     # Structured lines like "US/SAN FRANCISCO, CA 94103" include a US state code
-    # in the town segment. Keep the city name and move only the postal code.
     if postal_code and country in {"US", "CA"}:
         m_state = re.match(r"^(.*?)(?:,\s*|\s+)([A-Z]{2})$", town.strip())
         if m_state and len(m_state.group(1).split()) >= 2:
             town = m_state.group(1).strip(" ,")
 
     town = _clean_town_value(town)
-    return CountryTown(country=country, town=town or None, postal_code=postal_code), True
+
+    # ── DÉTECTION CRITIQUE : le "town" est-il en réalité un alias pays ? ──
+    # Ex : 3/JP/Taiwan → town="Taiwan" → resolve_country_code("Taiwan") = "TW"
+    # Si oui, le champ 3/ contient deux informations pays contradictoires.
+    conflict = {}
+    if town:
+        resolved_from_town = resolve_country_code(town)
+        if resolved_from_town and resolved_from_town != country:
+            conflict = {
+                "town_is_country": town,
+                "country_resolved": resolved_from_town,
+                "declared_country": country,
+            }
+
+    return CountryTown(country=country, town=town or None, postal_code=postal_code), True, conflict
 
 def _parse_place_of_birth(value):
     raw = _norm(value)
@@ -526,12 +548,18 @@ def _extract_country_postal_town_fragment(line):
                 if town: return m.start(), m.end(), CountryTown(country=cc, town=town, postal_code=m.group(2))
 
     # 1b. Standard inverse: POSTAL CC (ex: 60311 DE, 1000 TN).
+    # ⚠️ EXCLUSION: Ne pas confondre "SA" (suffixe org) avec le code pays pour "SOCIETE MEUBLATEX SA"
     # Le deuxième token est un pays, jamais une ville.
     m = re.search(r"^([A-Z0-9][A-Z0-9\- ]{2,10})\s+([A-Z]{2})$", raw, flags=re.IGNORECASE)
     if m:
         cc = m.group(2).upper().strip()
         postal = _norm(m.group(1)).strip()
-        if cc in COUNTRY_CODES and re.search(r"\d", postal):
+        # 🔥 EXCLUSION ORG: Si la ligne ressemble à un nom org (mot + suffixe org), ne pas traiter comme postal+pays
+        # Par ex: "SOCIETE MEUBLATEX SA" ne doit pas être parsé comme postal "SOCIETE MEUBLATEX" + country "SA"
+        org_keywords = {"SA", "SARL", "SAS", "EURL", "GmbH", "LLC", "LTD", "PLC", "AG", "SE", "BV", "SRL", "SPA", "OOO"}
+        is_likely_org = cc in org_keywords or any(postal.upper().endswith(" " + keyword) for keyword in org_keywords)
+        
+        if cc in COUNTRY_CODES and re.search(r"\d", postal) and not is_likely_org:
             return m.start(), m.end(), CountryTown(country=cc, town=None, postal_code=postal)
 
     # 2. Format court: B -6600 BASTOGNE
@@ -678,6 +706,13 @@ def _extract_geo_from_free_lines(lines, warnings):
     last = _norm(lines[-1])
     up = last.upper()
 
+    # 🔥 SKIP NOISE LINES: Si la dernière ligne est clairement du bruit (ATTN, REF, TEL...), 
+    # essayer la penultième ligne à la place
+    NOISE_KEYWORDS = {"ATTN", "REF", "TEL", "FAX", "PHONE", "C/O"}
+    if any(up.startswith(nk) for nk in NOISE_KEYWORDS) and len(lines) > 1:
+        # Essayer la ligne précédente
+        last = _norm(lines[-2])
+        up = last.upper()
     postal_marker = _extract_postal_marker(last)
     if postal_marker:
         consumed = 1
@@ -779,7 +814,10 @@ def _extract_geo_from_free_lines(lines, warnings):
         if potential_country in COUNTRY_CODES:
             potential_town = _clean_town_value(_norm(m_town_country_code.group(1)))
             # Validation: la ville doit avoir au moins 3 caractères et ne pas être un mot-clé d'adresse
-            if potential_town and not _contains_address_keyword(potential_town) and len(potential_town) >= 3:
+            # 🔥 EXCLUSION ORG: Ne pas confondre suffixes org (SA, SARL, etc.) avec codes pays
+            org_keywords = {"SA", "SARL", "SAS", "EURL", "GmbH", "LLC", "LTD", "PLC", "AG", "SE", "BV", "SRL", "SPA", "OOO"}
+            is_likely_org_suffix = potential_country in org_keywords or potential_town.upper().endswith(" " + potential_country)
+            if potential_town and not _contains_address_keyword(potential_town) and len(potential_town) >= 3 and not is_likely_org_suffix:
                 warnings.append(f"town_country_code_pattern_matched:{potential_town}→{potential_country}")
                 return CountryTown(country=potential_country, town=potential_town, postal_code=None), 1
 
@@ -827,6 +865,36 @@ def parse_free_party_field(pre, field_type, role, message_id):
         warnings.append("no_content_after_account")
         res.meta.parse_confidence = 0.0
         return res
+
+    # Cas inverse fréquent en champ libre: [postal + ville] / [adresse] / [raison sociale] / [bruit]
+    # Exemple: "2037 ARIANA" puis "Z.I. CHOTRANA 2" puis "SOCIETE MEUBLATEX SA".
+    reverse_layout_match = re.match(r"^(\d{4,6})\s+([A-ZÀÂÄÉÈÊËÎÏÔÖÚÙÜÆŒÇıŞş\s\-]+)$", content[0].upper())
+    if reverse_layout_match and len(content) >= 3:
+        reverse_postal = reverse_layout_match.group(1).strip()
+        reverse_town = _clean_town_value(reverse_layout_match.group(2).strip())
+        org_idx = None
+        for i in range(len(content) - 1, 0, -1):
+            candidate_line = content[i]
+            candidate_upper = candidate_line.upper()
+            if any(candidate_upper.startswith(prefix) for prefix in NOISE_PREFIXES):
+                continue
+            if _looks_like_org_continuation(candidate_line) or _detect_org([candidate_line]):
+                org_idx = i
+                break
+        if org_idx is not None:
+            res.name = [content[org_idx]]
+            tail_lines = [line for line in content[org_idx + 1:] if line]
+            if tail_lines:
+                res.name.extend(tail_lines)
+            res.address_lines = [line for line in content[1:org_idx] if line and not _contains_address_keyword(line)]
+            res.country_town = _apply_iban_and_capital_fallback(
+                CountryTown(country=iban_country, town=reverse_town, postal_code=reverse_postal),
+                iban_country, warnings
+            )
+            warnings.append("reverse_layout_postal_city_name_detected")
+            res.is_org = _detect_org(res.name)
+            res.meta.parse_confidence = 0.88
+            return res
 
     # 2. CAS SPÉCIAL : une seule ligne finissant par un pays
     if len(content) == 1:
@@ -883,6 +951,28 @@ def parse_free_party_field(pre, field_type, role, message_id):
 
     # 4. Parsing du NOM
     first = content[0]
+    
+    # 🔥 DÉTECTION SPÉCIALE: Si première ligne = "CODE_POSTAL VILLE", la traiter comme géo et prendre la ligne suivante comme nom
+    postal_city_match = re.match(r'^(\d{4,6})\s+([A-ZÀÂÄÉÈÊËÎÏÔÖÚÙÜÆŒÇıŞş\s\-]+)$', first.upper())
+    if postal_city_match and len(content) > 1:
+        # La première ligne est vraiment "postal + city", pas un nom
+        postal_part = postal_city_match.group(1).strip()
+        city_part = postal_city_match.group(2).strip()
+        if _is_known_city(city_part):
+            # Extraire la vraie ville et code postal
+            if res.country_town and not res.country_town.postal_code:
+                res.country_town.postal_code = postal_part
+            if res.country_town and not res.country_town.town:
+                res.country_town.town = city_part
+            warnings.append("postal_city_from_first_line")
+            # Prendre la ligne suivante comme nom
+            first = content[1]
+            remaining = content[2:]
+        else:
+            remaining = content[1:]
+    else:
+        remaining = content[1:]
+    
     split_name, split_addr = _split_inline_name_address(first)
     if split_addr:
         res.name = [split_name]
@@ -890,8 +980,6 @@ def parse_free_party_field(pre, field_type, role, message_id):
         warnings.append("name_address_mixed")
     else:
         res.name = [first]
-
-    remaining = content[1:]
 
     # Continuation org multi-ligne
     if remaining:
@@ -1055,8 +1143,33 @@ def parse_structured_50F(pre, message_id="MSG"):
         if tag == "1": res.name.append(value)
         elif tag == "2": res.address_lines.append(value)
         elif tag == "3":
-            parsed_ct, ok = _parse_structured_country_town(value)
-            if ok and parsed_ct: res.country_town = parsed_ct; seen_3 = True
+            parsed_ct, ok, conflict = _parse_structured_country_town(value)
+            if ok and parsed_ct:
+                res.country_town = parsed_ct
+                seen_3 = True
+                # ── Gestion des conflits pays déclaré ≠ pays dans le town ──
+                if conflict:
+                    town_val  = conflict["town_is_country"]
+                    resolved  = conflict["country_resolved"]
+                    declared  = conflict["declared_country"]
+                    warnings.append(
+                        f"country_embedded_in_town_line:3/{declared}/{town_val}"
+                        f"→town_is_country:{resolved}"
+                    )
+                    warnings.append(
+                        f"country_conflict_in_field3:{declared}≠{resolved}"
+                        f"→requires_human_intervention"
+                    )
+                    warnings.append("requires_manual_verification:country_conflict_field3")
+                    # Vérifier aussi la cohérence avec l'IBAN
+                    iban_c = pre.meta.iban_country if pre and pre.meta else None
+                    if iban_c and iban_c not in (declared, resolved):
+                        warnings.append(
+                            f"iban_country_mismatch:IBAN={iban_c}"
+                            f"≠declared={declared}≠town_country={resolved}"
+                            f"→requires_human_intervention"
+                        )
+                        warnings.append("requires_manual_verification:iban_country_3way_conflict")
             else:
                 res.country_town = CountryTown(country=None, town=value, postal_code=None)
                 warnings.append("invalid_structured_line_3")
@@ -1114,13 +1227,38 @@ def parse_structured_59F(pre, message_id="MSG"):
         if tag == "1": res.name.append(value)
         elif tag == "2": res.address_lines.append(value)
         elif tag == "3":
-            parsed_ct, ok = _parse_structured_country_town(value)
-            if ok and parsed_ct: res.country_town = parsed_ct; seen_3 = True
+            parsed_ct, ok, conflict = _parse_structured_country_town(value)
+            if ok and parsed_ct:
+                res.country_town = parsed_ct
+                seen_3 = True
+                # ── Gestion des conflits pays déclaré ≠ pays dans le town ──
+                if conflict:
+                    town_val  = conflict["town_is_country"]
+                    resolved  = conflict["country_resolved"]
+                    declared  = conflict["declared_country"]
+                    warnings.append(
+                        f"country_embedded_in_town_line:3/{declared}/{town_val}"
+                        f"→town_is_country:{resolved}"
+                    )
+                    warnings.append(
+                        f"country_conflict_in_field3:{declared}≠{resolved}"
+                        f"→requires_human_intervention"
+                    )
+                    warnings.append("requires_manual_verification:country_conflict_field3")
+                    iban_c = pre.meta.iban_country if pre and pre.meta else None
+                    if iban_c and iban_c not in (declared, resolved):
+                        warnings.append(
+                            f"iban_country_mismatch:IBAN={iban_c}"
+                            f"≠declared={declared}≠town_country={resolved}"
+                            f"→requires_human_intervention"
+                        )
+                        warnings.append("requires_manual_verification:iban_country_3way_conflict")
             else:
                 if value.upper() in COUNTRY_CODES:
                     res.country_town = CountryTown(country=value.upper(), town=None, postal_code=None)
                     seen_3 = True
-                else: warnings.append("invalid_structured_line_3")
+                else:
+                    warnings.append("invalid_structured_line_3")
         elif tag == "8":
             if seen_8:
                 warnings.append("T56_invalid_8_repetition")
